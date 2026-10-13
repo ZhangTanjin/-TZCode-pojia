@@ -1,0 +1,316 @@
+From 7e37107587d62c32c8bd8a5b831ba3897f226f44 Mon Sep 17 00:00:00 2001
+From: TanJin <tanjin@local.bench>
+Date: Sun, 11 Oct 2026 22:20:43 +0800
+Subject: [PATCH 5/8] persona: precise persona-mode assembly (no blast)
+
+---
+ .../packages/core/src/context/builder.ts      | 33 ++++++---
+ .../core/src/context/persona-source.ts        | 38 ++++++++++
+ .../core/src/context/sections/cli-prefix.ts   |  6 +-
+ .../core/src/runtime/methods/context.ts       |  3 +-
+ .../core/tests/context-builder.test.ts        | 72 +++++++++++++++++--
+ .../core/tests/persona-source.test.ts         | 38 ++++++++++
+ 6 files changed, 173 insertions(+), 17 deletions(-)
+ create mode 100644 apps/zcode-cli/packages/core/src/context/persona-source.ts
+ create mode 100644 apps/zcode-cli/packages/core/tests/persona-source.test.ts
+
+diff --git a/apps/zcode-cli/packages/core/src/context/builder.ts b/apps/zcode-cli/packages/core/src/context/builder.ts
+index 0bc0fcfa..4210c646 100644
+--- a/apps/zcode-cli/packages/core/src/context/builder.ts
++++ b/apps/zcode-cli/packages/core/src/context/builder.ts
+@@ -13,7 +13,7 @@ import type {
+ import type { ToolRegistry } from "../tool/registry.js";
+ import { estimateTokens } from "./utils.js";
+ import { buildCliPrefixSection } from "./sections/cli-prefix.js";
+-import { buildIdentitySection } from "./sections/identity.js";
++import { buildHarnessBlock, buildIdentitySection } from "./sections/identity.js";
+ import { buildWorkflowActorIdentitySection } from "./sections/workflow-actor.js";
+ import { buildEnvInfoSection, buildGitSystemContextSection } from "./sections/env-info.js";
+ import { buildSkillsSection } from "./sections/skills.js";
+@@ -101,8 +101,9 @@ export class ContextBuilder {
+     // 1. CLI / product prefix. Keep this as the short leading identity block.
+     // 「You are ZCode, an interactive coding agent」对一个
+     // 只对脚本说话、可能连读文件工具都没有的子代理是错的身份，且走在正确身份段前面。
++    // persona 模式换牌为 TZCode：身份结构保留，产品品牌让位。
+     if (!isWorkflowActor) {
+-      sections.push(buildCliPrefixSection());
++      sections.push(buildCliPrefixSection(hasCustomSystemPrompt));
+     }
+ 
+     // 2. Stable agent behavior or custom prompt body
+@@ -116,6 +117,17 @@ export class ContextBuilder {
+           content: customSystemPrompt ? `\n${customSystemPrompt}` : "",
+         }),
+       );
++      // 精准 persona 装配：不做整层爆破。Harness 运行机制说明保留在 persona 之后，
++      // 模型仍能从 system 层拿到工具权限模式 / mid-conversation system turns 等运行事实。
++      sections.push(
++        createSection({
++          name: "Agent Harness",
++          source: "identity",
++          injectionTarget: "system",
++          cacheHint: "stable",
++          content: buildHarnessBlock(),
++        }),
++      );
+     } else if (workflowActor !== undefined) {
+       sections.push(buildWorkflowActorIdentitySection(workflowActor));
+     } else {
+@@ -166,14 +178,19 @@ export class ContextBuilder {
+       if (outputStyleSection) {
+         sections.push(outputStyleSection);
+       }
++    } else {
++      // 精准 persona 装配的 dynamic 侧：环境信息与长上下文管理规则保留，
++      // 让 persona 会话同样拿到 cwd/platform/shell/模型名与压缩/自主运行纪律。
++      // desktop / 沟通规范 / session guidance / memory / output style 让位给 persona。
++      sections.push(buildEnvInfoSection(this.config.envInfo, this.config.model));
++    }
+ 
+-      // Context Management
+-      sections.push(buildContextManagementSection());
++    // Context Management
++    sections.push(buildContextManagementSection());
+ 
+-      const gitSystemContextSection = buildGitSystemContextSection(this.config.envInfo);
+-      if (gitSystemContextSection) {
+-        sections.push(gitSystemContextSection);
+-      }
++    const gitSystemContextSection = buildGitSystemContextSection(this.config.envInfo);
++    if (gitSystemContextSection) {
++      sections.push(gitSystemContextSection);
+     }
+ 
+     // 4. Skills appear as a meta user system-reminder, matching provider block layout.
+diff --git a/apps/zcode-cli/packages/core/src/context/persona-source.ts b/apps/zcode-cli/packages/core/src/context/persona-source.ts
+new file mode 100644
+index 00000000..71a9b947
+--- /dev/null
++++ b/apps/zcode-cli/packages/core/src/context/persona-source.ts
+@@ -0,0 +1,38 @@
++// ============================================================
++// Persona Source - 外置人格文件加载
++// ============================================================
++//
++// 精准 persona 模式的唯一内容入口。文件存在且非空即激活；
++// 缺失/为空自动回退原版装配，无需开关。
++//
++// 解析顺序：
++//   1. 环境变量 ZCODE_PERSONA_FILE 指定的绝对路径
++//   2. ~/.zcode/persona/persona.txt
++//
++// 每次 build() 现读：改文件即生效，与旧 cjs 补丁的热切换体验一致，
++// 一次 13KB 级 readFileSync 的开销可忽略。
++
++import { readFileSync } from "node:fs";
++import { homedir } from "node:os";
++import { isAbsolute, resolve } from "node:path";
++
++const PERSONA_FILE_ENV = "ZCODE_PERSONA_FILE";
++const DEFAULT_PERSONA_RELATIVE_PATH = ["persona", "persona.txt"] as const;
++
++export function resolvePersonaFilePath(env: NodeJS.ProcessEnv = process.env): string {
++  const fromEnv = env[PERSONA_FILE_ENV]?.trim();
++  if (fromEnv) return isAbsolute(fromEnv) ? fromEnv : resolve(process.cwd(), fromEnv);
++  return resolve(homedir(), ".zcode", ...DEFAULT_PERSONA_RELATIVE_PATH);
++}
++
++/** 读取 persona 文件；不存在或内容为空返回 undefined（回退原版装配）。 */
++export function loadPersonaContent(env: NodeJS.ProcessEnv = process.env): string | undefined {
++  let raw: string;
++  try {
++    raw = readFileSync(resolvePersonaFilePath(env), "utf8");
++  } catch {
++    return undefined;
++  }
++  const trimmed = raw.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++}
+diff --git a/apps/zcode-cli/packages/core/src/context/sections/cli-prefix.ts b/apps/zcode-cli/packages/core/src/context/sections/cli-prefix.ts
+index ae710d65..3a4ea88b 100644
+--- a/apps/zcode-cli/packages/core/src/context/sections/cli-prefix.ts
++++ b/apps/zcode-cli/packages/core/src/context/sections/cli-prefix.ts
+@@ -6,9 +6,11 @@ import type { ContextSection } from "../types.js";
+ import { estimateTokens } from "../utils.js";
+ 
+ const CLI_PREFIX_PROMPT = "You are ZCode, an interactive coding agent";
++/** persona 模式换牌：保留交互式编码代理身份结构，产品品牌让位给定制身份。 */
++const PERSONA_CLI_PREFIX_PROMPT = "You are TZCode, an interactive coding agent";
+ 
+-export function buildCliPrefixSection(): ContextSection {
+-  const content = CLI_PREFIX_PROMPT;
++export function buildCliPrefixSection(personaMode = false): ContextSection {
++  const content = personaMode ? PERSONA_CLI_PREFIX_PROMPT : CLI_PREFIX_PROMPT;
+ 
+   return {
+     name: "CLI Prefix",
+diff --git a/apps/zcode-cli/packages/core/src/runtime/methods/context.ts b/apps/zcode-cli/packages/core/src/runtime/methods/context.ts
+index 4ef09e62..2b61ae61 100644
+--- a/apps/zcode-cli/packages/core/src/runtime/methods/context.ts
++++ b/apps/zcode-cli/packages/core/src/runtime/methods/context.ts
+@@ -1,5 +1,6 @@
+ import { join } from "node:path";
+ 
++import { loadPersonaContent } from "../../context/persona-source.js";
+ import {
+   traceContextToLogContext,
+   createContextBuilder,
+@@ -147,7 +148,7 @@ export function createContextBuilderFromSnapshot(
+     agentProfiles: this.config.subagents?.profiles,
+     embeddedSearchEnabled: resolveRuntimeEmbeddedSearchEnabled(this),
+     skillMetadataBudget: this.config.skillMetadataBudget,
+-    customSystemPrompt: this.config.systemPrompt,
++    customSystemPrompt: this.config.systemPrompt ?? loadPersonaContent(),
+     workflowActor: this.config.workflowActor,
+     language: this.config.language,
+     outputStyle: this.config.outputStyle,
+diff --git a/apps/zcode-cli/packages/core/tests/context-builder.test.ts b/apps/zcode-cli/packages/core/tests/context-builder.test.ts
+index a492c822..bb0d0152 100644
+--- a/apps/zcode-cli/packages/core/tests/context-builder.test.ts
++++ b/apps/zcode-cli/packages/core/tests/context-builder.test.ts
+@@ -380,13 +380,18 @@ describe("ContextBuilder meta user context", () => {
+ 
+     expect(result.sections.some((section) => section.source === "desktop_context")).toBe(false);
+ 
+-    expect(result.systemMessages.map((message) => message.role)).toEqual(["system", "system"]);
++    // 精准 persona 装配：prefix 换牌 + persona/harness stable + env/ctxmgmt/git dynamic。
++    expect(result.systemMessages.map((message) => message.role)).toEqual([
++      "system",
++      "system",
++      "system",
++    ]);
+     expect(result.metaUserAttachments.map((attachment) => attachment.source)).toEqual([
+       "context_prefix",
+     ]);
+-    expect(result.systemMessages[0]?.content).toBe("You are ZCode, an interactive coding agent");
++    expect(result.systemMessages[0]?.content).toBe("You are TZCode, an interactive coding agent");
+     expect(result.systemMessages[0]?.content).not.toContain("# Agent Identity");
+-    expect(result.systemMessages[1]?.content).toBe("\nYou are concise for this task.");
++    expect(result.systemMessages[1]?.content?.startsWith("\nYou are concise for this task.\n\n# Harness\n")).toBe(true);
+     expect(result.systemMessages[1]?.content).not.toContain("# Task Behavior");
+     expect(result.systemMessages[1]?.content).not.toContain("# Agent Identity");
+     const meta = metaAttachment(result, "context_prefix");
+@@ -409,13 +414,15 @@ describe("ContextBuilder meta user context", () => {
+     expect(providerText).not.toContain("## Memory");
+     expect(providerText).not.toContain("# Memory");
+     expect(providerText).not.toContain("## Current Environment");
+-    expect(providerText).not.toContain("# Environment");
+-    expect(providerText).not.toContain("# Context management");
++    // 骨架保留：环境信息与上下文管理在 persona 模式下照常注入。
++    expect(providerText).toContain("# Environment");
++    expect(providerText).toContain("# Context management");
++    expect(providerText).toContain("gitStatus: This is the git status");
++    expect(providerText).toContain("M package.json");
+     expect(providerText).not.toContain("# Language");
+     expect(providerText).not.toContain("# Output Style: Terse");
+     expect(providerText).not.toContain("# Function Result Clearing");
+     expect(providerText).not.toContain("# Summarize Tool Results");
+-    expect(providerText).not.toContain("M package.json");
+     expect(providerText).not.toContain("## 项目信息");
+     expect(providerText).not.toContain("# user_instructions");
+   });
+@@ -1604,4 +1611,57 @@ describe("context builder — workflow actor identity", () => {
+     );
+     expect(text).toContain("\n\n# Harness\n- Text you output outside of tool use");
+   });
++
++  it("assembles the precise persona layout: TZCode prefix, persona+harness stable, operational skeleton dynamic", () => {
++    const result = createContextBuilder({
++      workingDirectory: "/workspace",
++      presentationSurface: "zcode_desktop",
++      customSystemPrompt: "PERSONA-BODY-MARKER",
++      envInfo: {
++        cwd: "/workspace",
++        platform: "linux",
++        shell: "bash",
++        osVersion: "Linux 6.6.0",
++        isGitRepository: false,
++      },
++      currentDate: "2026-10-11",
++      guidanceToolNames: ["Read", "Skill"],
++    }).build();
++
++    // 三段 system：换牌 prefix / persona+harness (stable) / env+ctxmgmt (dynamic)。
++    expect(result.systemMessages.map((message) => message.role)).toEqual([
++      "system",
++      "system",
++      "system",
++    ]);
++    expect(result.systemMessages[0]?.content).toBe("You are TZCode, an interactive coding agent");
++    expect(result.systemMessages[1]?.content).toContain("PERSONA-BODY-MARKER");
++    expect(result.systemMessages[1]?.content).toContain("# Harness");
++    expect(result.systemMessages[1]?.content).toContain(
++      "Tools run behind a user-selected permission mode",
++    );
++    expect(result.systemMessages[2]?.content).toContain("# Environment");
++    expect(result.systemMessages[2]?.content).toContain("# Context management");
++
++    // persona 让位的段：identity / 安全行 / desktop / 沟通规范 / session guidance。
++    const providerText = [
++      ...result.systemMessages.map((message) => message.content),
++      ...result.metaUserAttachments.map((attachment) => attachment.content),
++    ].join("\n");
++    expect(providerText).not.toContain("interactive ZCode agent that helps users");
++    expect(providerText).not.toContain("IMPORTANT: This workstation is a pre-authorized");
++    expect(providerText).not.toContain("ZCode Desktop");
++    expect(providerText).not.toContain("# Communicating with the user");
++    expect(providerText).not.toContain("# Session-specific guidance");
++    // meta_user 功能件不爆破。
++    expect(providerText).toContain("# currentDate");
++  });
++
++  it("keeps the stock prefix when no persona is configured", () => {
++    expect(buildCliPrefixSection().content).toBe("You are ZCode, an interactive coding agent");
++    expect(buildCliPrefixSection(false).content).toBe("You are ZCode, an interactive coding agent");
++    expect(buildCliPrefixSection(true).content).toBe(
++      "You are TZCode, an interactive coding agent",
++    );
++  });
+ });
+diff --git a/apps/zcode-cli/packages/core/tests/persona-source.test.ts b/apps/zcode-cli/packages/core/tests/persona-source.test.ts
+new file mode 100644
+index 00000000..90c9d226
+--- /dev/null
++++ b/apps/zcode-cli/packages/core/tests/persona-source.test.ts
+@@ -0,0 +1,38 @@
++import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterAll, describe, expect, it } from "vitest";
++import {
++  loadPersonaContent,
++  resolvePersonaFilePath,
++} from "../src/context/persona-source.js";
++
++const tempDir = mkdtempSync(join(tmpdir(), "zcode-persona-"));
++afterAll(() => {
++  rmSync(tempDir, { recursive: true, force: true });
++});
++
++describe("persona-source", () => {
++  it("resolves the default path under ~/.zcode/persona", () => {
++    const resolved = resolvePersonaFilePath({});
++    expect(resolved).toContain(join(".zcode", "persona", "persona.txt"));
++  });
++
++  it("prefers ZCODE_PERSONA_FILE when set to an absolute path", () => {
++    const file = join(tempDir, "custom-persona.txt");
++    expect(resolvePersonaFilePath({ ZCODE_PERSONA_FILE: file })).toBe(file);
++  });
++
++  it("returns trimmed content for a populated persona file", () => {
++    const file = join(tempDir, "populated.txt");
++    writeFileSync(file, "  PERSONA-CONTENT \n", "utf8");
++    expect(loadPersonaContent({ ZCODE_PERSONA_FILE: file })).toBe("PERSONA-CONTENT");
++  });
++
++  it("returns undefined for missing or whitespace-only files", () => {
++    expect(loadPersonaContent({ ZCODE_PERSONA_FILE: join(tempDir, "absent.txt") })).toBeUndefined();
++    const empty = join(tempDir, "empty.txt");
++    writeFileSync(empty, "   \n", "utf8");
++    expect(loadPersonaContent({ ZCODE_PERSONA_FILE: empty })).toBeUndefined();
++  });
++});
+-- 
+2.55.0.windows.5
+

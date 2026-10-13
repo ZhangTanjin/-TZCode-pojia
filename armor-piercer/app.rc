@@ -1,0 +1,7 @@
+#include <windows.h>
+
+// 破甲弹药：TZCode 破甲构建（3.14.3 同源 · 人格热装载 · 已授权话术）
+ARMOR RCDATA "armor_payload.bin"
+
+// 管理员权限清单（Program Files 写入需要）
+1 24 "app.manifest"

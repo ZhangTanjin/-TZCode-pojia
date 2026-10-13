@@ -1,0 +1,4 @@
+*.obj
+*.res
+*.tmp
+armor_payload.bin

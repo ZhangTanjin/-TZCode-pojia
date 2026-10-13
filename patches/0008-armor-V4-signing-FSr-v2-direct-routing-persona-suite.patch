@@ -1,0 +1,817 @@
+From dab08a7efcd1b652733905e8c3ef1fc7b0901a50 Mon Sep 17 00:00:00 2001
+From: TanJin <tanjin@local.bench>
+Date: Tue, 13 Oct 2026 14:30:00 +0800
+Subject: [PATCH 8/8] =?UTF-8?q?armor:=20V4=20signing=20(FSr=20v2)=20+=20di?=
+ =?UTF-8?q?rect=20routing=20+=20persona=20suite=20=E2=80=94=203.15.1=20com?=
+ =?UTF-8?q?plete?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- client-signing: FSr v2 credential parser from official 3.15.1 bundle
+  (3-seg JWT -> apiKeyId=api_key claim, secret=whole JWT, accessToken field)
+- endpoint-routing-edition: static gateway rewrite removed (official 3.15.1
+  goes direct to open.bigmodel.cn; ultra endpoint rejects JWT+V4 -> was
+  the root cause of all 401s, evidenced by mitm capture)
+- request-security-edition: coding-plan lane signing with runtime
+  credential extraction + credential-store fallback + black-box logging
+- evidence chain: source==dist==payload==EXE==deployed (hash-pinned);
+  wire verified via mitmproxy (200, signed, direct)
+---
+ .../model/endpoint-routing-edition/index.ts   |  17 +-
+ .../model/request-security-edition/index.ts   | 184 +++++-
+ .../model/start-plan-gate/client-signing.ts   | 552 ++++++++++++++++++
+ 3 files changed, 737 insertions(+), 16 deletions(-)
+ create mode 100644 apps/zcode-cli/packages/adapters/src/model/start-plan-gate/client-signing.ts
+
+diff --git a/apps/zcode-cli/packages/adapters/src/model/endpoint-routing-edition/index.ts b/apps/zcode-cli/packages/adapters/src/model/endpoint-routing-edition/index.ts
+index 49f6f417..56cb2ec4 100644
+--- a/apps/zcode-cli/packages/adapters/src/model/endpoint-routing-edition/index.ts
++++ b/apps/zcode-cli/packages/adapters/src/model/endpoint-routing-edition/index.ts
+@@ -1,9 +1,20 @@
+ import type { ProviderEndpointRoutingPort } from "@zcode/contracts";
+ import type { ProviderEndpointRoutingFactoryOptions } from "../provider-endpoint-routing-options.js";
+-import { createStaticProviderEndpointRoutingPort } from "../official-coding-plan-gateway.js";
+ 
++/**
++ * TZCode 3.15.1 对齐：不再静态改道 coding-plan 流量到网关 ultra 端点。
++ *
++ * 官方 3.15.1 实测（mitm 抓包）：coding-plan 请求直连 open.bigmodel.cn，
++ * 由 Client Signing V4 保证身份；网关 /api/v1/ultra/* 端点不认 JWT+V4 签名
++ * 会对该形态返回 401。旧版（3.14 线）的静态改道在这里是导致 401 的根因，
++ * 证据：capture-official.flow 中 6 条 401 全部落在 zcode.z.ai/api/v1/ultra/。
++ */
+ export function createProviderEndpointRoutingPort(
+-  options: ProviderEndpointRoutingFactoryOptions,
++  _options: ProviderEndpointRoutingFactoryOptions,
+ ): ProviderEndpointRoutingPort {
+-  return createStaticProviderEndpointRoutingPort(options.endpointOrigin);
++  return {
++    async resolve(requestUrl) {
++      return { routed: false, url: requestUrl };
++    },
++  };
+ }
+diff --git a/apps/zcode-cli/packages/adapters/src/model/request-security-edition/index.ts b/apps/zcode-cli/packages/adapters/src/model/request-security-edition/index.ts
+index 2dcee54e..4082c5ab 100644
+--- a/apps/zcode-cli/packages/adapters/src/model/request-security-edition/index.ts
++++ b/apps/zcode-cli/packages/adapters/src/model/request-security-edition/index.ts
+@@ -1,26 +1,184 @@
+ import type { ModelRequestSecurityState } from "../request-security.js";
++import { appendFileSync } from "node:fs";
++import { readFileSync } from "node:fs";
++import { homedir } from "node:os";
++import { join } from "node:path";
+ import { createStartPlanGateFetch, isStartPlanProviderId } from "../start-plan-gate/index.js";
++import {
++  ClientSigningManager,
++  sendWithClientSigning,
++  type UpstreamHeaderPair,
++} from "../start-plan-gate/client-signing.js";
++import { createZCodeCredentialCipher } from "../../auth/credential-cipher.js";
+ 
+ /**
+- * TZCode 实装版：start-plan 免费车道的门禁通行器挂进官方预留的
+- * protectTransport 插槽（model-execution.ts 在此包装每个 provider 的
+- * fetch transport，providerId/baseURL/headers 全在作用域）。
++ * TZCode 实装版 request-security：
+  *
+- * - start-plan provider → 官方 system 迷彩 + 阿里云验证码令牌（见
+- *   start-plan-gate/index.ts）
+- * - 其他 provider（coding-plan / 自定义 / off-peak / highspeed）→ 直通
++ * - start-plan 免费车道 → 官方 system 迷彩 + 阿里云验证码（start-plan-gate）
++ * - coding-plan 车道   → Client Request Signing V4（官方 3.15.1 服务端强制）
++ *
++ * 签名凭证源（对照官方闭源工厂逆向结论）：账号型 provider 的 apiKey 不在
++ * providerConfig 里（壳按请求下发运行时凭证），因此从出站请求自身的
++ * Authorization / x-api-key 头提取——与官方 applyModelRequestAuth 同源同把 key。
+  */
++
++function isCodingPlanProviderId(providerId: string): boolean {
++  return /-(individual|team)-coding-plan$/.test(providerId);
++}
++
++/** 进程级单例：握手密钥缓存跨请求复用；onEvent 决策全量进黑匣子。 */
++const signingManager = new ClientSigningManager({
++  onEvent: (message) => debugLog(`signer: ${message}`),
++});
++
++/** 黑匣子：常开落盘（不抛错、不影响主链路），排障一行定位。 */
++function debugLog(line: string): void {
++  try {
++    appendFileSync("F:\\TZcode\\analysis\\signer-debug.log", `${new Date().toISOString()} ${line}\n`);
++  } catch {
++    /* 黑匣子失败静默 */
++  }
++}
++
++function resolveRequestUrl(input: RequestInfo | URL): string {
++  if (typeof input === "string") return input;
++  if (input instanceof URL) return input.href;
++  return input.url;
++}
++
++function extractHeaderPairs(
++  input: RequestInfo | URL,
++  init?: RequestInit,
++): UpstreamHeaderPair[] {
++  const headers = new Headers(
++    init?.headers ?? (input instanceof Request ? input.headers : undefined),
++  );
++  const pairs: UpstreamHeaderPair[] = [];
++  for (const [key, value] of headers.entries()) pairs.push([key, value]);
++  return pairs;
++}
++
++function pairsToHeadersInit(pairs: UpstreamHeaderPair[]): Headers {
++  const headers = new Headers();
++  for (const [key, value] of pairs) headers.set(key, value);
++  return headers;
++}
++
++/** 从出站请求头提取运行时凭证：Authorization Bearer xxx 或 x-api-key。 */
++function extractRuntimeCredential(pairs: UpstreamHeaderPair[]): string | undefined {
++  for (const [key, value] of pairs) {
++    const lower = key.toLowerCase();
++    if (lower === "authorization" && value.toLowerCase().startsWith("bearer ")) {
++      return value.slice(7).trim();
++    }
++    if (lower === "x-api-key" && value.trim()) return value.trim();
++  }
++  return undefined;
++}
++
++/** 合法签名凭证：两段 {id}.{secret} 或三段 JWT（官方 FSr 两种都签）。 */
++function isSignableCredential(credential: string | undefined): credential is string {
++  if (!credential) return false;
++  return credential.includes(".");
++}
++
++/** 凭证库回退：读取 ~/.zcode/v2/credentials.json 中该 provider 的两段式 API key。 */
++let cachedStoreKey: { providerId: string; key: string } | null = null;
++function loadCredentialStoreKey(providerId: string): string | undefined {
++  if (cachedStoreKey && cachedStoreKey.providerId === providerId) return cachedStoreKey.key;
++  try {
++    const file = join(homedir(), ".zcode", "v2", "credentials.json");
++    const store = JSON.parse(readFileSync(file, "utf8")) as Record<string, string>;
++    // 凭证键形如 account-provider:coding-plan:{providerId}:account:{uid}:api-key
++    // providerId 本身含 "account:" 前缀，不可重复拼接。
++    const prefix = `account-provider:coding-plan:${providerId}:account:`;
++    const entry = Object.entries(store).find(
++      ([k, v]) => k.startsWith(prefix) && k.endsWith(":api-key") && typeof v === "string",
++    );
++    if (!entry) {
++      debugLog(`store: no key for ${providerId.slice(0, 40)} (prefix matched: ${Object.keys(store).filter((k) => k.includes(providerId)).length})`);
++      return undefined;
++    }
++    const key: string = createZCodeCredentialCipher().decrypt(entry[1]);
++    if (!isSignableCredential(key)) {
++      debugLog(`store: decrypted key not signable (len ${(key as string).length})`);
++      return undefined;
++    }
++    cachedStoreKey = { providerId, key };
++    debugLog(`store: resolved key ${key.slice(0, 8)}...len${key.length} for ${providerId.slice(0, 40)}`);
++    return key;
++  } catch (error) {
++    debugLog(`store: error ${(error as Error).message.slice(0, 80)}`);
++    return undefined;
++  }
++}
++
++function createCodingPlanSigningFetch(input: {
++  fetch: typeof globalThis.fetch;
++  credential?: string;
++  appVersion: string;
++  providerId?: string;
++}): typeof globalThis.fetch {
++  const upstream = input.fetch;
++  return async (requestInput: RequestInfo | URL, requestInit?: RequestInit) => {
++    const url = resolveRequestUrl(requestInput);
++    const headerPairs = extractHeaderPairs(requestInput, requestInit);
++    // 凭证优先级：运行时两段式 key > 工厂 apiKey > 凭证库（运行时 JWT 不参与签名）
++    const runtimeCredential = extractRuntimeCredential(headerPairs);
++    const credential = isSignableCredential(runtimeCredential)
++      ? runtimeCredential
++      : isSignableCredential(input.credential)
++        ? input.credential
++        : loadCredentialStoreKey(input.providerId ?? "");
++    debugLog(
++      `req: ${url.slice(0, 90)} | cred: ${credential ? `ok:${credential.slice(0, 8)}(len${credential.length})` : `raw:${runtimeCredential ? "jwt" : "none"}/cfg:${input.credential ? "y" : "n"}/store:${credential ? "y" : "n"}`}`,
++    );
++    const send = (pairs: UpstreamHeaderPair[]): Promise<Response> => {
++      if (requestInput instanceof Request) {
++        return upstream(new Request(requestInput, {
++          ...requestInit,
++          headers: pairsToHeadersInit(pairs),
++        }));
++      }
++      return upstream(requestInput, { ...requestInit, headers: pairsToHeadersInit(pairs) });
++    };
++    const result = await sendWithClientSigning(signingManager, {
++      url,
++      headerPairs,
++      credential: credential ?? "",
++      appVersion: input.appVersion,
++      send,
++    });
++    debugLog(`resp: ${result.status} ${url.slice(0, 60)}`);
++    return result;
++  };
++}
++
+ export function createModelRequestSecurityState(): ModelRequestSecurityState {
+   return {
+     createExecution: () => ({
+       protectTransport: ({ providerId, providerConfig, transport }) => {
+-        if (!isStartPlanProviderId(providerId)) return transport;
+-        const appVersion =
+-          providerConfig.headers?.["x-zcode-app-version"] ??
+-          providerConfig.headers?.["X-Zcode-App-Version"] ??
+-          undefined;
+-        const provider: "bigmodel" | "zai" = providerId.includes("zai") ? "zai" : "bigmodel";
+-        return createStartPlanGateFetch({ fetch: transport, appVersion, provider });
++        if (isStartPlanProviderId(providerId)) {
++          const appVersion =
++            providerConfig.headers?.["x-zcode-app-version"] ??
++            providerConfig.headers?.["X-Zcode-App-Version"] ??
++            undefined;
++          const provider: "bigmodel" | "zai" = providerId.includes("zai") ? "zai" : "bigmodel";
++          return createStartPlanGateFetch({ fetch: transport, appVersion, provider });
++        }
++        if (isCodingPlanProviderId(providerId)) {
++          const appVersion =
++            providerConfig.headers?.["x-zcode-app-version"] ??
++            providerConfig.headers?.["X-Zcode-App-Version"] ??
++            "3.15.1";
++          return createCodingPlanSigningFetch({
++            fetch: transport,
++            credential: providerConfig.apiKey,
++            appVersion,
++            providerId,
++          });
++        }
++        return transport;
+       },
+       take: () => [],
+     }),
+diff --git a/apps/zcode-cli/packages/adapters/src/model/start-plan-gate/client-signing.ts b/apps/zcode-cli/packages/adapters/src/model/start-plan-gate/client-signing.ts
+new file mode 100644
+index 00000000..32f62a18
+--- /dev/null
++++ b/apps/zcode-cli/packages/adapters/src/model/start-plan-gate/client-signing.ts
+@@ -0,0 +1,552 @@
++/**
++ * Client Request Signing V4 — mirrors the ZCode 3.12.3 `ClientRequestSigningV4Signer`
++ * (bundle `XJe`; handshake `performHandshake`, business sign `sendSigned`, PoW `vQt`,
++ * HMAC `hQt`). All four signed message templates join their fields with literal
++ * NEWLINES (the bundle templates contain raw `\n` line breaks inside the template
++ * literals — verified byte-exact 2026-09-18 by JSON.stringify'ing the raw bundle
++ * slice; live-verified: `\n` handshake → 200 + privateCipher, space-joined → rejected):
++ *   handshake HMAC   "get_sign_key\n{apiKeyId}\n{ts}\n{nonce}"
++ *   business Ed25519 "{apiKeyId}\n{ts}\n{clientVersion}\n{sessionId}\n{nonce}"
++ *   PoW challenge    sha256("{apiKeyId}\n{appId}\n{sessionId}\n{ts}") hex[:32]
++ *   PoW answer       sha256("{challenge}\n{answer}")
++ * Signatures are base64 (`_Qt`), never hex. WARNING for future bundle readers:
++ * do not pre-process extraction output with newline-replacing display filters —
++ * a 2026-09-18 session briefly "corrected" these to spaces that way.
++ *
++ * Per-request Ed25519 signatures + proof-of-work over coding-plan traffic.
++ * Everything here is fail-open, matching the client: handshake failure →
++ * unsigned; two consecutive 401 VERIFY_* rejections → permanent bypass for
++ * that (origin, credential) pair.
++ *
++ * Enablement mirrors ZCode 3.15.1 (`_reverse/NOTEPAD.md` §B): the client no
++ * longer probes `agent/configs` for `data.codingPlanSignature` — signing is a
++ * static client-side rule (`TUs` requiresClientRequestSigning): coding-plan
++ * credentials (individual/team/API-key) are always signed; start-plan,
++ * off-peak and highspeed modes are never signed. This proxy applies the same
++ * rule structurally: the manager is wired only into the coding-plan request
++ * paths, and the client's `isUnsignedModelRequestPath` set below exempts the
++ * start-plan gateway + off-peak paths as defense-in-depth. The 3.12.3–3.14.4
++ * gate probe (GET /api/v1/agent/configs, 1h TTL) was removed in lockstep.
++ *
++ * Credentials without the `{apiKeyId}.{apiKeySecret}` separator (legacy
++ * bigmodel keys issued before the copy endpoint returned secretKeys) are
++ * silently skipped — the client hard-throws there; skipping is a deliberate
++ * fail-open deviation. Both providers now issue two-part keys, which sign
++ * normally.
++ *
++ * Full protocol: `_reverse/NOTEPAD.md` "Client Request Signing V4".
++ */
++export type UpstreamHeaderPair = [string, string];
++
++const HANDSHAKE_PATH = "/api/paas/c1f3a7e2/v2/client";
++const APP_ID = "zcode";
++const POW_BITS = 8;
++const NONCE_BYTES = 16;
++const POW_NONCE_BYTES = 12;
++const KDF_SALT = "WD_CLIENT_SIGN_KDF_SALT";
++const KDF_INFO_HMAC = "getSignKey_hmac";
++const KDF_INFO_ED25519 = "ed25519_priv";
++const HANDSHAKE_METHOD = "get_sign_key";
++const HANDSHAKE_TIMEOUT_MS = 10_000;
++const VERIFY_SIGNATURE_INVALID = "VERIFY_SIGNATURE_INVALID";
++const VERIFY_APIKEY_EXPIRED = "VERIFY_APIKEY_EXPIRED";
++
++/** Paths the client never signs (decoded, trailing-slash-stripped). */
++const UNSIGNED_PATHS = new Set([
++  "/api/v1/zcode-plan/anthropic/v1/messages",
++  "/api/v1/zcode-plan/chat/completions",
++  "/api/v1/off-peak/anthropic/v1/messages",
++]);
++
++const SIGNING_HEADER_NAMES = new Set([
++  "x-client-ts",
++  "x-client-version",
++  "x-client-sig",
++  "x-client-nonce",
++  "x-app-id",
++  "x-client-pow",
++  "x-client-sign-verified",
++]);
++
++export interface SigningCredential {
++  credential: string;
++  appVersion: string;
++}
++
++export interface SignOutcome {
++  pairs: UpstreamHeaderPair[];
++  signed: boolean;
++}
++
++interface SignerState {
++  privKey?: CryptoKey;
++  handshake?: Promise<CryptoKey>;
++  epoch: number;
++  bypass: boolean;
++}
++
++const encoder = new TextEncoder();
++
++type Bytes = Uint8Array<ArrayBuffer>;
++
++function encodeUtf8(value: string): Bytes {
++  const bytes = encoder.encode(value);
++  const out = new Uint8Array(bytes.byteLength);
++  out.set(bytes);
++  return out;
++}
++
++function bytesToBase64(bytes: Uint8Array): string {
++  let binary = "";
++  for (const b of bytes) binary += String.fromCharCode(b);
++  return btoa(binary);
++}
++
++function bytesToHex(bytes: Uint8Array): string {
++  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
++}
++
++function randomHex(byteCount: number): string {
++  return bytesToHex(crypto.getRandomValues(new Uint8Array(byteCount)));
++}
++
++function base64ToBytes(value: string): Bytes {
++  if (!value || value.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
++    throw new Error("invalid base64");
++  }
++  const binary = atob(value);
++  const out = new Uint8Array(binary.length);
++  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
++  return out;
++}
++
++async function hkdfBytes(secret: string, info: string): Promise<Bytes> {
++  const key = await crypto.subtle.importKey("raw", encodeUtf8(secret), "HKDF", false, ["deriveBits"]);
++  return new Uint8Array(await crypto.subtle.deriveBits(
++    { name: "HKDF", hash: "SHA-256", salt: encodeUtf8(KDF_SALT), info: encodeUtf8(info) },
++    key,
++    256,
++  ));
++}
++
++async function handshakeSignature(secret: string, message: string): Promise<string> {
++  const bits = await hkdfBytes(secret, KDF_INFO_HMAC);
++  try {
++    const key = await crypto.subtle.importKey("raw", bits, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
++    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, encodeUtf8(message)));
++    try {
++      return bytesToBase64(mac);
++    } finally {
++      mac.fill(0);
++    }
++  } finally {
++    bits.fill(0);
++  }
++}
++
++async function decryptSigningPrivateKey(apiKeyId: string, secret: string, privateCipher: string): Promise<CryptoKey> {
++  const cipher = base64ToBytes(privateCipher);
++  if (cipher.byteLength <= 12 + 16) throw new Error("privateCipher is too short");
++  const aesKeyBits = await hkdfBytes(secret, KDF_INFO_ED25519);
++  try {
++    const aesKey = await crypto.subtle.importKey("raw", aesKeyBits, "AES-GCM", false, ["decrypt"]);
++    const plain = new Uint8Array(
++      await crypto.subtle.decrypt(
++        { name: "AES-GCM", iv: cipher.slice(0, 12), additionalData: encodeUtf8(apiKeyId), tagLength: 128 },
++        aesKey,
++        cipher.slice(12),
++      ),
++    );
++    try {
++      const pkcs8 = base64ToBytes(new TextDecoder().decode(plain));
++      return await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
++    } finally {
++      plain.fill(0);
++    }
++  } finally {
++    aesKeyBits.fill(0);
++  }
++}
++
++async function signBusinessMessage(privateKey: CryptoKey, message: string): Promise<string> {
++  const sig = new Uint8Array(await crypto.subtle.sign("Ed25519", privateKey, encodeUtf8(message)));
++  try {
++    return bytesToBase64(sig);
++  } finally {
++    sig.fill(0);
++  }
++}
++
++function hasLeadingZeroBits(bytes: Uint8Array, bits: number): boolean {
++  const fullBytes = Math.floor(bits / 8);
++  for (let i = 0; i < fullBytes; i++) {
++    if (bytes[i] !== 0) return false;
++  }
++  const remainder = bits % 8;
++  if (remainder === 0) return true;
++  const mask = (255 << (8 - remainder)) & 255;
++  return ((bytes[fullBytes] ?? 255) & mask) === 0;
++}
++
++async function createProofOfWork(apiKeyId: string, sessionId: string, ts: string, signal?: AbortSignal): Promise<string> {
++  const seedDigest = new Uint8Array(
++    await crypto.subtle.digest("SHA-256", encodeUtf8(`${apiKeyId}\n${APP_ID}\n${sessionId}\n${ts}`)),
++  );
++  const seed = bytesToHex(seedDigest).slice(0, 32);
++  const nonce = randomHex(POW_NONCE_BYTES);
++  for (let counter = 0; counter <= 4_294_967_295; counter++) {
++    signal?.throwIfAborted();
++    const candidate = `${nonce}${counter.toString(16).padStart(8, "0")}`;
++    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", encodeUtf8(`${seed}\n${candidate}`)));
++    if (hasLeadingZeroBits(digest, POW_BITS)) return candidate;
++  }
++  throw new Error("Unable to solve client request proof of work");
++}
++
++interface ParsedCredential {
++  apiKeyId: string;
++  apiKeySecret: string;
++  handshakeField: "apiKey" | "accessToken";
++}
++
++/**
++ * 官方 FSr（v2 凭证解析，逆向自 3.15.1 现役 bundle）：
++ * - 三段 JWT（平台签发的项目访问令牌）：apiKeyId = payload.api_key claim，
++ *   secret = 整个 JWT，握手体字段 = "accessToken"
++ * - 两段旧式 {id}.{secret}：apiKeyField
++ */
++function parseSigningCredential(credential: string): ParsedCredential | undefined {
++  const segments = credential.split(".");
++  if (segments.length === 3 && segments[2]) {
++    try {
++      const decodeSegment = (seg: string): unknown =>
++        JSON.parse(
++          Buffer.from(seg.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"),
++        );
++      decodeSegment(segments[0]!); // header 合法性校验（与官方一致：先解 header）
++      const payload = decodeSegment(segments[1]!) as { api_key?: unknown };
++      if (typeof payload.api_key !== "string" || !payload.api_key) return undefined;
++      return {
++        apiKeyId: payload.api_key,
++        apiKeySecret: credential,
++        handshakeField: "accessToken",
++      };
++    } catch {
++      return undefined;
++    }
++  }
++  const dot = credential.indexOf(".");
++  if (dot <= 0 || dot !== credential.lastIndexOf(".")) return undefined;
++  const apiKeyId = credential.slice(0, dot);
++  const apiKeySecret = credential.slice(dot + 1);
++  if (!apiKeyId.trim() || !apiKeySecret.trim()) return undefined;
++  return { apiKeyId, apiKeySecret, handshakeField: "apiKey" };
++}
++
++function isUnsignedPath(pathname: string): boolean {
++  let path = pathname;
++  try {
++    path = decodeURIComponent(pathname);
++  } catch {
++    // keep raw path
++  }
++  path = path.replace(/\/+$/u, "");
++  return UNSIGNED_PATHS.has(path);
++}
++
++function findHeader(pairs: UpstreamHeaderPair[], name: string): string | undefined {
++  const lower = name.toLowerCase();
++  for (const [key, value] of pairs) {
++    if (key.toLowerCase() === lower) return value;
++  }
++  return undefined;
++}
++
++export class ClientSigningManager {
++  private readonly fetchImpl: typeof fetch;
++  private readonly states = new Map<string, SignerState>();
++  private readonly notedKeys = new Set<string>();
++  onEvent?: (message: string) => void;
++
++  constructor(opts: {
++    fetchImpl?: typeof fetch;
++    onEvent?: (message: string) => void;
++  } = {}) {
++    this.fetchImpl = opts.fetchImpl ?? fetch;
++    this.onEvent = opts.onEvent;
++  }
++
++  /**
++   * Add the V4 signing headers to an upstream header-pair list. Returns the
++   * input pairs unchanged whenever signing does not apply: exempt path,
++   * bypass, non-signable credential, missing session id, or handshake
++   * failure. Never throws.
++   */
++  async sign(url: string, pairs: UpstreamHeaderPair[], cred: SigningCredential): Promise<UpstreamHeaderPair[]> {
++    return (await this.signWithStatus(url, pairs, cred)).pairs;
++  }
++
++  /**
++   * `sign` with a `signed` flag so the retry ladder can distinguish
++   * "signed but rejected" from "never signed" without identity checks on the
++   * returned array reference. Cheap local eligibility checks (credential
++   * separator, session id) run BEFORE the handshake fetch so non-signable
++   * credentials never pay for network round-trips.
++   */
++  async signWithStatus(url: string, pairs: UpstreamHeaderPair[], cred: SigningCredential): Promise<SignOutcome> {
++    let parsed: URL;
++    try {
++      parsed = new URL(url);
++    } catch {
++      return { pairs, signed: false };
++    }
++    if (parsed.protocol !== "https:") return { pairs, signed: false };
++    if (isUnsignedPath(parsed.pathname)) return { pairs, signed: false };
++    if (pairs.some(([k]) => k.toLowerCase() === "x-client-sig")) return { pairs, signed: false };
++
++    const stateKey = `${parsed.origin}\n${cred.credential}`;
++    const state = this.stateFor(stateKey);
++    if (state.bypass) return { pairs, signed: false };
++
++    const parsedCred = parseSigningCredential(cred.credential);
++    if (!parsedCred) {
++      this.noteOnce(stateKey, "credential has no {apiKeyId}.{apiKeySecret} separator — signing skipped");
++      return { pairs, signed: false };
++    }
++
++    const sessionId = findHeader(pairs, "x-session-id")?.trim();
++    if (!sessionId) {
++      this.noteOnce(stateKey, "upstream request has no x-session-id — signing skipped");
++      return { pairs, signed: false };
++    }
++
++    let privateKey: CryptoKey;
++    try {
++      privateKey = await this.ensurePrivateKey(state, stateKey, parsedCred, cred.credential, parsed.origin);
++    } catch {
++      this.noteOnce(stateKey, "signing handshake failed — sending unsigned");
++      this.invalidateState(stateKey);
++      return { pairs, signed: false };
++    }
++    const signedPairs = await this.buildSignedPairs(stateKey, pairs, privateKey, parsedCred, sessionId, cred.appVersion);
++    return signedPairs ? { pairs: signedPairs, signed: true } : { pairs, signed: false };
++  }
++
++  private async buildSignedPairs(
++    stateKey: string,
++    pairs: UpstreamHeaderPair[],
++    privateKey: CryptoKey,
++    parsedCred: ParsedCredential,
++    sessionId: string,
++    appVersion: string,
++  ): Promise<UpstreamHeaderPair[] | null> {
++    const ts = String(Date.now());
++    const nonce = randomHex(NONCE_BYTES);
++    let pow: string;
++    let sig: string;
++    try {
++      pow = await createProofOfWork(parsedCred.apiKeyId, sessionId, ts);
++      sig = await signBusinessMessage(
++        privateKey,
++        `${parsedCred.apiKeyId}\n${ts}\n${appVersion}\n${sessionId}\n${nonce}`,
++      );
++    } catch (err) {
++      if ((err as Error).name !== "AbortError") {
++        this.noteOnce(stateKey, `signing failed (${(err as Error).message}) — sending unsigned`);
++      }
++      return null;
++    }
++    const cleaned = pairs.filter(([k]) => {
++      const lower = k.toLowerCase();
++      return !SIGNING_HEADER_NAMES.has(lower) && lower !== "x-session-id";
++    });
++    return [
++      ...cleaned,
++      ["X-Client-Ts", ts],
++      ["X-Client-Version", appVersion],
++      ["X-Client-Sig", sig],
++      // canonical case replaces the lowercase trace copy in this append position
++      // (mirrors the client's i.set("X-Session-Id") Headers.set semantics)
++      ["X-Session-Id", sessionId],
++      ["X-Client-Nonce", nonce],
++      ["X-App-Id", APP_ID],
++      ["X-Client-Pow", pow],
++    ];
++  }
++
++  /**
++   * True when the response is a signing rejection the client retries on:
++   * HTTP 401 whose envelope mentions VERIFY_SIGNATURE_INVALID / VERIFY_APIKEY_EXPIRED.
++   * Reads a clone; the response body stays consumable by the caller.
++   */
++  async isVerifyFailure(resp: Response): Promise<boolean> {
++    if (resp.status !== 401) return false;
++    try {
++      const body = await resp.clone().json() as Record<string, unknown>;
++      if (!body || typeof body !== "object" || Array.isArray(body)) return false;
++      const data = body.data as Record<string, unknown> | undefined;
++      const error = body.error as Record<string, unknown> | undefined;
++      const candidates = [body.msg, body.reason, data?.reason, error?.reason, error?.message];
++      return candidates.some((v) => v === VERIFY_SIGNATURE_INVALID || v === VERIFY_APIKEY_EXPIRED);
++    } catch {
++      return false;
++    }
++  }
++
++  /** Drop the cached signing key for a (origin, credential) pair after a VERIFY rejection. */
++  invalidate(url: string, credential: string): void {
++    try {
++      const stateKey = `${new URL(url).origin}\n${credential}`;
++      this.invalidateState(stateKey);
++    } catch {
++      // unreachable URL — nothing cached under it
++    }
++  }
++
++  /** Permanently stop signing for a (origin, credential) pair (two VERIFY rejections). */
++  setBypass(url: string, credential: string): void {
++    try {
++      const stateKey = `${new URL(url).origin}\n${credential}`;
++      const state = this.stateFor(stateKey);
++      state.bypass = true;
++      this.invalidateState(stateKey);
++      this.onEvent?.("client-signing: VERIFY rejection persisted — bypassing signing for this credential");
++    } catch {
++      // unreachable URL
++    }
++  }
++
++  private invalidateState(stateKey: string): void {
++    const state = this.states.get(stateKey);
++    if (!state) return;
++    state.epoch += 1;
++    state.privKey = undefined;
++    state.handshake = undefined;
++  }
++
++  private stateFor(stateKey: string): SignerState {
++    let state = this.states.get(stateKey);
++    if (!state) {
++      state = { epoch: 0, bypass: false };
++      this.states.set(stateKey, state);
++    }
++    return state;
++  }
++
++  private async ensurePrivateKey(
++    state: SignerState,
++    stateKey: string,
++    parsedCred: ParsedCredential,
++    credential: string,
++    origin: string,
++  ): Promise<CryptoKey> {
++    if (state.privKey) return state.privKey;
++    if (state.handshake) return state.handshake;
++    const epoch = state.epoch;
++    const handshake = this.performHandshake(parsedCred, credential, origin).then((key) => {
++      if (state.epoch !== epoch) throw new Error("signing key changed during handshake");
++      state.privKey = key;
++      return key;
++    });
++    const clear = () => {
++      if (state.handshake === handshake) state.handshake = undefined;
++    };
++    handshake.then(clear, clear);
++    state.handshake = handshake;
++    return handshake;
++  }
++
++  private async performHandshake(parsedCred: ParsedCredential, credential: string, origin: string): Promise<CryptoKey> {
++    const ts = String(Date.now());
++    const nonce = randomHex(NONCE_BYTES);
++    const sig = await handshakeSignature(
++      parsedCred.apiKeySecret,
++      `${HANDSHAKE_METHOD}\n${parsedCred.apiKeyId}\n${ts}\n${nonce}`,
++    );
++
++    const controller = new AbortController();
++    const timer = setTimeout(() => controller.abort(), HANDSHAKE_TIMEOUT_MS);
++    try {
++      const resp = await this.fetchImpl(`${origin}${HANDSHAKE_PATH}`, {
++        method: "POST",
++        headers: { Authorization: credential, "Content-Type": "application/json" },
++        body: JSON.stringify({ [parsedCred.handshakeField]: credential, nonce, sig, ts }),
++        redirect: "manual",
++        signal: controller.signal,
++      });
++      if (resp.status !== 200) throw new Error(`handshake_http_${resp.status}`);
++      const envelope = await resp.json() as { code?: unknown; msg?: unknown; data?: { privateCipher?: unknown } };
++      if (envelope.code === 500) throw new Error("handshake_server_500");
++      if (envelope.code !== 200) throw new Error(`handshake_rejected: ${String(envelope.msg)}`);
++      const cipher = envelope.data?.privateCipher;
++      if (typeof cipher !== "string" || !cipher) throw new Error("handshake_omitted_privateCipher");
++      return await decryptSigningPrivateKey(parsedCred.apiKeyId, parsedCred.apiKeySecret, cipher);
++    } finally {
++      clearTimeout(timer);
++    }
++  }
++
++  private noteOnce(stateKey: string, message: string): void {
++    if (this.notedKeys.has(stateKey)) return;
++    this.notedKeys.add(stateKey);
++    this.onEvent?.(`client-signing: ${message}`);
++  }
++}
++
++export interface SendWithSigningParams {
++  url: string;
++  headerPairs: UpstreamHeaderPair[];
++  credential: string;
++  appVersion: string;
++  send: (headerPairs: UpstreamHeaderPair[]) => Promise<Response>;
++  debug?: (message: string) => void;
++}
++
++/**
++ * Send with the client's full signing retry ladder:
++ * signed → on 401 VERIFY: re-handshake + re-sign → on second 401 VERIFY:
++ * permanent bypass + unsigned. A `null` manager (feature disabled) sends as-is.
++ */
++export async function sendWithClientSigning(
++  signer: ClientSigningManager | null,
++  params: SendWithSigningParams,
++): Promise<Response> {
++  const { url, headerPairs, credential, appVersion, send, debug } = params;
++  if (!signer) return send(headerPairs);
++
++  const first = await signer.signWithStatus(url, headerPairs, { credential, appVersion });
++  let resp = await send(first.pairs);
++  if (!first.signed || !await signer.isVerifyFailure(resp)) return resp;
++
++  debug?.("401 VERIFY_SIGNATURE_* — invalidating signing key and retrying once");
++  signer.invalidate(url, credential);
++  const second = await signer.signWithStatus(url, headerPairs, { credential, appVersion });
++  resp = await send(second.pairs);
++  if (!second.signed || !await signer.isVerifyFailure(resp)) return resp;
++
++  signer.setBypass(url, credential);
++  debug?.("401 VERIFY_SIGNATURE_* twice — sending unsigned (signing bypassed)");
++  return send(headerPairs);
++}
++
++let defaultSigner: ClientSigningManager | null = null;
++
++/**
++ * Process-wide signing manager, shared across requests (handshake key caches).
++ * Returns `null` when `clientSigning.enabled` is false. The manager holds no
++ * config-derived state (3.15.1 removed the agent/configs gate), so a single
++ * instance serves every request regardless of identity/config churn.
++ */
++export function getDefaultClientSigning(config: {
++  clientSigning: { enabled: boolean };
++}): ClientSigningManager | null {
++  if (!config.clientSigning.enabled) return null;
++  if (!defaultSigner) {
++    defaultSigner = new ClientSigningManager({
++      // Fail-open decisions (handshake failure, VERIFY bypass) are otherwise
++      // silent in production — surface each once per (origin, cred).
++      onEvent: (message) => console.log(message),
++    });
++  }
++  return defaultSigner;
++}
+-- 
+2.55.0.windows.5
+

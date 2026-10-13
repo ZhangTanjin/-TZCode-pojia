@@ -1,0 +1,1088 @@
+// ============================================================
+// ZCode 破甲弹 v2.1 — 官方 ZCode 的破甲部署器
+// C++ / 纯 Win32 · 暗色主题 · 自绘控件 · 四页签 · 弹药内嵌
+//
+//   [部署]     状态总览（状态徽章）· 部署/恢复/刷新
+//   [人格]     程序内查看 + 编辑 + 保存（UTF-8 原子写入自动备份）
+//   [人格目录] 程序内浏览，双击载入编辑器
+//   [日志]     操作流水
+// ============================================================
+
+#define UNICODE
+#define _UNICODE
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+
+#include <windows.h>
+#include <commctrl.h>
+#include <tlhelp32.h>
+#include <shlobj.h>
+#include <shellapi.h>
+
+#include <cstdio>
+#include <cstdarg>
+#include <cstdint>
+#include <array>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
+#include <algorithm>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+
+// ------------------------------------------------------------
+// 调色板
+// ------------------------------------------------------------
+
+static const COLORREF C_BG      = RGB(24, 25, 29);   // 窗口底
+static const COLORREF C_PANEL   = RGB(33, 35, 41);   // 卡片
+static const COLORREF C_CTRL    = RGB(45, 47, 55);   // 控件底
+static const COLORREF C_CTRL_HV = RGB(58, 61, 70);   // 悬停
+static const COLORREF C_LINE    = RGB(55, 58, 67);   // 分隔线
+static const COLORREF C_TEXT    = RGB(233, 235, 239);
+static const COLORREF C_TEXT2   = RGB(150, 156, 165);
+static const COLORREF C_ACCENT  = RGB(86, 136, 255);
+static const COLORREF C_OK      = RGB(72, 199, 118);
+static const COLORREF C_WARN    = RGB(250, 190, 60);
+static const COLORREF C_ERR     = RGB(240, 90, 80);
+
+static HBRUSH g_br_bg, g_br_panel, g_br_ctrl, g_br_ctrl_hv, g_br_edit;
+
+static const wchar_t* APP_TITLE = L"ZCode 破甲弹";
+static const char* ARMOR_MARKER_A = "You are TZCode, an interactive coding agent";
+static const char* OFFICIAL_MARKER_A = "You are ZCode, an interactive coding agent";
+
+enum CtrlId {
+  IDC_DEPLOY = 101,
+  IDC_RESTORE = 102,
+  IDC_REFRESH = 103,
+  IDC_PERSONA_SAVE = 110,
+  IDC_PERSONA_RELOAD = 111,
+  IDC_PERSONA_NOTEPAD = 112,
+  IDC_DIR_REFRESH = 120,
+  IDC_DIR_EXPLORER = 121,
+  IDC_RESTART_ZCODE = 130,
+};
+
+enum TabIndex { TAB_DEPLOY = 0, TAB_PERSONA = 1, TAB_DIR = 2, TAB_LOG = 3, TAB_COUNT = 4 };
+static const wchar_t* TAB_NAMES[TAB_COUNT] = {L"🚀 部署", L"🧬 人格", L"📁 人格目录", L"📜 日志"};
+
+// ------------------------------------------------------------
+// 工具（编码/格式化/文件）
+// ------------------------------------------------------------
+
+static std::wstring Utf8ToWide(const std::string& s) {
+  if (s.empty()) return std::wstring();
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+  std::wstring w(n, 0);
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+  return w;
+}
+
+static std::string WideToUtf8(const std::wstring& w) {
+  if (w.empty()) return std::string();
+  int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+  std::string s(n, 0);
+  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+  return s;
+}
+
+static std::wstring Fmt(const wchar_t* fmt, ...) {
+  wchar_t buf[4096];
+  va_list args;
+  va_start(args, fmt);
+  _vsnwprintf_s(buf, _TRUNCATE, fmt, args);
+  va_end(args);
+  return buf;
+}
+
+static std::wstring FormatNumber(unsigned long long v) {
+  std::wstring s = std::to_wstring(v);
+  for (int pos = (int)s.size() - 3; pos > 0; pos -= 3) s.insert((size_t)pos, L",");
+  return s;
+}
+
+static std::wstring FileTimeStr(const wchar_t* path) {
+  WIN32_FILE_ATTRIBUTE_DATA fa = {};
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return L"—";
+  SYSTEMTIME st;
+  FileTimeToSystemTime(&fa.ftLastWriteTime, &st);
+  return Fmt(L"%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+}
+
+static std::wstring FileTimeStrDirect(const FILETIME& ft) {
+  SYSTEMTIME st;
+  FileTimeToSystemTime(&ft, &st);
+  return Fmt(L"%04d-%02d-%02d %02d:%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute);
+}
+
+static unsigned long long FileSizeOf(const wchar_t* path) {
+  WIN32_FILE_ATTRIBUTE_DATA fa = {};
+  if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return 0;
+  return ((unsigned long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+}
+
+static bool ReadFileBytes(const wchar_t* path, std::string* out) {
+  HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (f == INVALID_HANDLE_VALUE) return false;
+  unsigned long long size = 0;
+  LARGE_INTEGER li;
+  if (GetFileSizeEx(f, &li)) size = (unsigned long long)li.QuadPart;
+  out->assign((size_t)size, '\0');
+  DWORD read_total = 0;
+  while (read_total < size) {
+    DWORD got = 0;
+    if (!ReadFile(f, &(*out)[read_total],
+                  (DWORD)std::min<size_t>(size - read_total, 1 << 24), &got, nullptr) ||
+        got == 0)
+      break;
+    read_total += got;
+  }
+  CloseHandle(f);
+  return read_total == size;
+}
+
+static bool WriteFileAtomic(const wchar_t* path, const void* data, size_t len, std::wstring* err) {
+  std::wstring tmp = std::wstring(path) + L".tmp";
+  HANDLE f = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (f == INVALID_HANDLE_VALUE) {
+    *err = Fmt(L"创建临时文件失败 (err=%lu)", GetLastError());
+    return false;
+  }
+  DWORD written = 0;
+  BOOL ok = WriteFile(f, data, (DWORD)len, &written, nullptr) && written == len;
+  FlushFileBuffers(f);
+  CloseHandle(f);
+  if (!ok) {
+    DeleteFileW(tmp.c_str());
+    *err = L"写入临时文件失败";
+    return false;
+  }
+  if (!MoveFileExW(tmp.c_str(), path, MOVEFILE_REPLACE_EXISTING)) {
+    DeleteFileW(tmp.c_str());
+    *err = Fmt(L"替换目标失败 (err=%lu)", GetLastError());
+    return false;
+  }
+  return true;
+}
+
+static bool BytesContain(const std::string& hay, const char* needle) {
+  return hay.find(needle) != std::string::npos;
+}
+
+static std::wstring JoinPath(const std::wstring& a, const std::wstring& b) {
+  if (a.empty() || a.back() == L'\\') return a + b;
+  return a + L"\\" + b;
+}
+
+// ------------------------------------------------------------
+// 路径解析
+// ------------------------------------------------------------
+
+static std::wstring GetZCodeRootFromProcesses() {
+  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (snap == INVALID_HANDLE_VALUE) return L"";
+  PROCESSENTRY32W pe = {};
+  pe.dwSize = sizeof(pe);
+  std::wstring result;
+  if (Process32FirstW(snap, &pe)) {
+    do {
+      if (_wcsicmp(pe.szExeFile, L"ZCode.exe") == 0) {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+        if (h) {
+          wchar_t buf[MAX_PATH] = {};
+          DWORD n = MAX_PATH;
+          if (QueryFullProcessImageNameW(h, 0, buf, &n)) result = buf;
+          CloseHandle(h);
+          if (!result.empty()) break;
+        }
+      }
+    } while (Process32NextW(snap, &pe));
+  }
+  CloseHandle(snap);
+  if (result.empty()) return L"";
+  size_t p = result.find_last_of(L"\\/");
+  return p == std::wstring::npos ? L"" : result.substr(0, p);
+}
+
+struct InstallInfo {
+  std::wstring root, glmDir, cjsPath, bakPath;
+  bool found = false;
+};
+
+static InstallInfo DetectInstall() {
+  InstallInfo info;
+  std::vector<std::wstring> roots;
+  std::wstring running = GetZCodeRootFromProcesses();
+  if (!running.empty()) roots.push_back(running);
+  wchar_t buf[MAX_PATH] = {};
+  if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr, 0, buf)))
+    roots.push_back(JoinPath(buf, L"ZCode"));
+  if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILESX86, nullptr, 0, buf)))
+    roots.push_back(JoinPath(buf, L"ZCode"));
+  if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf)))
+    roots.push_back(JoinPath(JoinPath(buf, L"Programs"), L"ZCode"));
+  for (const auto& root : roots) {
+    std::wstring cjs = JoinPath(JoinPath(JoinPath(root, L"resources"), L"glm"), L"zcode.cjs");
+    if (GetFileAttributesW(cjs.c_str()) != INVALID_FILE_ATTRIBUTES) {
+      info.root = root;
+      info.glmDir = JoinPath(JoinPath(root, L"resources"), L"glm");
+      info.cjsPath = cjs;
+      info.bakPath = cjs + L".official.bak";
+      info.found = true;
+      return info;
+    }
+  }
+  return info;
+}
+
+static std::wstring PersonaDir() {
+  wchar_t buf[MAX_PATH] = {};
+  if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROFILE, nullptr, 0, buf)))
+    return JoinPath(JoinPath(buf, L".zcode"), L"persona");
+  return L"";
+}
+
+static std::wstring PersonaPath() { return JoinPath(PersonaDir(), L"persona.txt"); }
+
+// ------------------------------------------------------------
+// UI 状态
+// ------------------------------------------------------------
+
+static HWND g_main;
+static HFONT g_font, g_font_mono, g_font_title, g_font_tab;
+
+// 按钮元数据（自绘）
+struct Btn {
+  HWND h;
+  COLORREF fill;     // 常态填充
+  COLORREF text;     // 文字色
+  bool hover = false;
+};
+static std::vector<Btn> g_btns;
+
+// 状态行配色（徽章式）
+static std::map<HWND, COLORREF> g_label_colors;
+static std::set<HWND> g_panel_labels;
+
+static int g_cur_tab = TAB_DEPLOY;
+static RECT g_tab_strip = {};  // 页签条区域
+static int g_start_tab = TAB_DEPLOY;  // 命令行指定的起始页签
+
+// 部署页
+static HWND g_s_install, g_s_build, g_s_file, g_s_check, g_s_persona;
+static HWND g_btn_deploy, g_btn_restore, g_btn_refresh, g_btn_restart;
+static RECT g_card_deploy = {};
+
+// 人格页
+static HWND g_s_personainfo;
+static HWND g_edit_persona;
+static HWND g_btn_save, g_btn_reload, g_btn_notepad;
+static std::wstring g_editing_path;
+
+// 目录页
+static HWND g_list_dir;
+static HWND g_btn_dir_refresh, g_btn_dir_explorer;
+
+// 日志页
+static HWND g_edit_log;
+
+static std::vector<HWND> g_pages[TAB_COUNT];
+static void ShowCurrentPage();
+static void RegPage(int tab, HWND ctrl) { g_pages[tab].push_back(ctrl); }
+
+static void Log(const std::wstring& line) {
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  std::wstring stamp = Fmt(L"[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+  int len = GetWindowTextLengthW(g_edit_log);
+  std::wstring text;
+  if (len > 0) {
+    text.assign(len, L'\0');
+    GetWindowTextW(g_edit_log, &text[0], len + 1);
+    text.resize(len);
+  }
+  text += stamp + line + L"\r\n";
+  if (text.size() > 60000) text = text.substr(text.size() - 50000);
+  SetWindowTextW(g_edit_log, text.c_str());
+  SendMessageW(g_edit_log, EM_SETSEL, text.size(), text.size());
+  SendMessageW(g_edit_log, EM_SCROLLCARET, 0, 0);
+}
+
+// ------------------------------------------------------------
+// 业务逻辑
+// ------------------------------------------------------------
+
+static std::wstring IdentifyBundle(const wchar_t* path) {
+  std::string bytes;
+  if (!ReadFileBytes(path, &bytes)) return L"读取失败";
+  if (BytesContain(bytes, ARMOR_MARKER_A)) return L"TZCode 破甲版（已部署）";
+  if (BytesContain(bytes, OFFICIAL_MARKER_A)) return L"官方原版";
+  return L"未知构建";
+}
+
+static void SetLabel(HWND label, const std::wstring& text, COLORREF color) {
+  g_label_colors[label] = color;
+  SetWindowTextW(label, text.c_str());
+}
+
+static void RefreshStatus() {
+  InstallInfo info = DetectInstall();
+  if (!info.found) {
+    SetLabel(g_s_install, L"安装目录：未找到（ZCode 未安装？）", C_ERR);
+    SetLabel(g_s_build, L"当前构建：—", C_TEXT2);
+    SetLabel(g_s_file, L"文件信息：—", C_TEXT2);
+    SetLabel(g_s_check, L"标记验证：—", C_TEXT2);
+  } else {
+    SetLabel(g_s_install, L"安装目录  " + info.root, C_TEXT);
+    std::wstring build = IdentifyBundle(info.cjsPath.c_str());
+    COLORREF bc = build == L"TZCode 破甲版（已部署）"  ? C_OK
+                  : build == L"官方原版" ? C_WARN
+                                         : C_ERR;
+    SetLabel(g_s_build, L"当前构建  ● " + build, bc);
+    SetLabel(g_s_file,
+             Fmt(L"文件信息  %s 字节 · %s · 官方备份：%s",
+                 FormatNumber(FileSizeOf(info.cjsPath.c_str())).c_str(),
+                 FileTimeStr(info.cjsPath.c_str()).c_str(),
+                 GetFileAttributesW(info.bakPath.c_str()) != INVALID_FILE_ATTRIBUTES ? L"已有" : L"无"),
+             C_TEXT2);
+    std::string bytes;
+    ReadFileBytes(info.cjsPath.c_str(), &bytes);
+    bool tz = BytesContain(bytes, ARMOR_MARKER_A);
+    bool pl = BytesContain(bytes, "ZCODE_PERSONA_FILE");
+    SetLabel(g_s_check,
+             Fmt(L"标记验证  TZCode %s · 人格装载器 %s", tz ? L"✓" : L"✗", pl ? L"✓" : L"✗"),
+             tz && pl ? C_OK : C_ERR);
+  }
+  std::wstring persona = PersonaPath();
+  if (GetFileAttributesW(persona.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    SetLabel(g_s_persona,
+             Fmt(L"人格文件  ● 在位（%s 字节 · %s）",
+                 FormatNumber(FileSizeOf(persona.c_str())).c_str(), FileTimeStr(persona.c_str()).c_str()),
+             C_OK);
+  } else {
+    SetLabel(g_s_persona, L"人格文件  ● 缺失 — 破甲版将回退官方装配", C_WARN);
+  }
+}
+
+static void DoDeploy() {
+  InstallInfo info = DetectInstall();
+  if (!info.found) {
+    Log(L"✗ 未找到 ZCode 安装目录，无法部署。");
+    return;
+  }
+  Log(L"开始部署 → " + info.cjsPath);
+
+  std::wstring current = IdentifyBundle(info.cjsPath.c_str());
+  if (current == L"官方原版") {
+    if (CopyFileW(info.cjsPath.c_str(), info.bakPath.c_str(), FALSE)) {
+      Log(L"✓ 官方原版已备份 → zcode.cjs.official.bak");
+    } else {
+      Log(Fmt(L"✗ 备份失败 (err=%lu)", GetLastError()));
+      return;
+    }
+  } else if (current == L"TZCode 破甲版（已部署）") {
+    Log(L"· 当前已是破甲版（保留既有官方备份）");
+  } else {
+    Log(L"! 当前构建未知——继续部署（建议先手动备份）");
+  }
+
+  HRSRC res = FindResourceW(nullptr, L"ARMOR", RT_RCDATA);
+  if (!res) {
+    Log(L"✗ 内嵌弹药缺失——程序损坏。");
+    return;
+  }
+  HGLOBAL handle = LoadResource(nullptr, res);
+  if (!handle) {
+    Log(L"✗ 装载弹药资源失败。");
+    return;
+  }
+  void* data = LockResource(handle);
+  DWORD size = SizeofResource(nullptr, res);
+  Log(Fmt(L"· 弹药就绪：%s 字节（TZCode 破甲构建）", FormatNumber(size).c_str()));
+
+  std::wstring err;
+  if (!WriteFileAtomic(info.cjsPath.c_str(), data, size, &err)) {
+    Log(L"✗ " + err);
+    Log(L"  提示：请完全退出 ZCode（托盘右键退出）后重试。");
+    return;
+  }
+  Log(L"✓ 已写入破甲构建。");
+
+  std::wstring build = IdentifyBundle(info.cjsPath.c_str());
+  Log(L"· 部署后识别：" + build);
+  if (build == L"TZCode 破甲版（已部署）")
+    Log(L"✅ 部署成功——完全退出并重启 ZCode 后生效。");
+  else
+    Log(L"✗ 部署后验证未通过。");
+  RefreshStatus();
+}
+
+static void DoRestartZCode() {
+  InstallInfo info = DetectInstall();
+  if (!info.found) {
+    Log(L"✗ 未找到 ZCode 安装目录，无法重启。");
+    return;
+  }
+  std::wstring exe = JoinPath(info.root, L"ZCode.exe");
+  if (GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    Log(L"✗ 未找到 " + exe);
+    return;
+  }
+  Log(L"· 正在结束 ZCode 全部进程…");
+  STARTUPINFOW si = {};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi = {};
+  std::wstring cmd = L"cmd.exe /c taskkill /F /IM ZCode.exe >nul 2>&1";
+  if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr,
+                     nullptr, &si, &pi)) {
+    WaitForSingleObject(pi.hProcess, 10'000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+  }
+  Sleep(1500);
+  // explorer 中转启动：不继承本程序的管理员权限
+  std::wstring exp = L"explorer.exe \"" + exe + L"\"";
+  STARTUPINFOW si2 = {};
+  si2.cb = sizeof(si2);
+  PROCESS_INFORMATION pi2 = {};
+  wchar_t buf[MAX_PATH * 2] = {};
+  wcsncpy_s(buf, exp.c_str(), _TRUNCATE);
+  if (CreateProcessW(nullptr, buf, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                     &si2, &pi2)) {
+    CloseHandle(pi2.hProcess);
+    CloseHandle(pi2.hThread);
+    Log(L"✓ ZCode 已重启（正常权限）。部署/恢复操作后用它立即生效。");
+  } else {
+    Log(Fmt(L"✗ 启动失败 (err=%lu)，请手动启动。", GetLastError()));
+  }
+}
+
+static void DoRestore() {
+  InstallInfo info = DetectInstall();
+  if (!info.found) {
+    Log(L"✗ 未找到 ZCode 安装目录。");
+    return;
+  }
+  if (GetFileAttributesW(info.bakPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    Log(L"✗ 未找到官方备份（zcode.cjs.official.bak）。");
+    return;
+  }
+  std::string bytes;
+  if (!ReadFileBytes(info.bakPath.c_str(), &bytes)) {
+    Log(L"✗ 读取备份失败。");
+    return;
+  }
+  std::wstring err;
+  if (!WriteFileAtomic(info.cjsPath.c_str(), bytes.data(), bytes.size(), &err)) {
+    Log(L"✗ " + err);
+    return;
+  }
+  Log(L"✓ 已恢复官方原版。重启 ZCode 后生效。");
+  RefreshStatus();
+}
+
+// ---------- 人格编辑 ----------
+
+static void UpdatePersonaInfoLine() {
+  std::wstring p = g_editing_path.empty() ? PersonaPath() : g_editing_path;
+  if (GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    SetLabel(g_s_personainfo,
+             Fmt(L"编辑文件  %s（%s 字节 · %s）", p.c_str(),
+                 FormatNumber(FileSizeOf(p.c_str())).c_str(), FileTimeStr(p.c_str()).c_str()),
+             C_TEXT2);
+  } else {
+    SetLabel(g_s_personainfo, L"编辑文件  " + p + L"（不存在，保存时创建）", C_WARN);
+  }
+}
+
+static void LoadPersonaIntoEditor(const wchar_t* path) {
+  g_editing_path = path;
+  std::string utf8;
+  if (ReadFileBytes(path, &utf8)) {
+    SetWindowTextW(g_edit_persona, Utf8ToWide(utf8).c_str());
+    Log(L"· 已载入 " + std::wstring(path));
+  } else {
+    SetWindowTextW(g_edit_persona,
+                   L"（文件不存在或不可读）\r\n\r\n直接在下面输入内容并点「保存」即可创建新人格文件。");
+    Log(L"· 文件不存在，编辑器进入新建模式：" + std::wstring(path));
+  }
+  UpdatePersonaInfoLine();
+}
+
+static void SavePersonaFromEditor() {
+  std::wstring path = g_editing_path.empty() ? PersonaPath() : g_editing_path;
+  CreateDirectoryW(PersonaDir().c_str(), nullptr);
+  int len = GetWindowTextLengthW(g_edit_persona);
+  std::wstring w(len, L'\0');
+  if (len > 0) GetWindowTextW(g_edit_persona, &w[0], len + 1);
+  w.resize(len);
+  std::string utf8 = WideToUtf8(w);
+
+  if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) {
+    CopyFileW(path.c_str(), (path + L".bak").c_str(), FALSE);
+  }
+  std::wstring err;
+  if (!WriteFileAtomic(path.c_str(), utf8.data(), utf8.size(), &err)) {
+    Log(L"✗ 保存失败：" + err);
+    return;
+  }
+  Log(L"✓ 已保存：" + path +
+        Fmt(L"（%s 字节，旧版本备份为 .bak）", FormatNumber(utf8.size()).c_str()));
+  Log(L"  开新对话即生效，无需重启 ZCode。");
+  UpdatePersonaInfoLine();
+  RefreshStatus();
+}
+
+// ---------- 人格目录 ----------
+
+static void RefreshDirList() {
+  std::wstring dir = PersonaDir();
+  CreateDirectoryW(dir.c_str(), nullptr);
+  ListView_DeleteAllItems(g_list_dir);
+
+  std::vector<std::array<std::wstring, 3>> rows;
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW(JoinPath(dir, L"*").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      std::wstring name = fd.cFileName;
+      if (name == L"." || name == L"..") continue;
+      bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+      unsigned long long size =
+          isDir ? 0 : ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+      rows.push_back({name, isDir ? L"⟨目录⟩" : FormatNumber(size), FileTimeStrDirect(fd.ftLastWriteTime)});
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const std::array<std::wstring, 3>& a, const std::array<std::wstring, 3>& b) {
+              return a[0] < b[0];
+            });
+
+  int i = 0;
+  for (const auto& r : rows) {
+    LVITEMW item = {};
+    item.mask = LVIF_TEXT;
+    item.iItem = i;
+    item.pszText = const_cast<LPWSTR>(r[0].c_str());
+    ListView_InsertItem(g_list_dir, &item);
+    ListView_SetItemText(g_list_dir, i, 1, const_cast<LPWSTR>(r[1].c_str()));
+    ListView_SetItemText(g_list_dir, i, 2, const_cast<LPWSTR>(r[2].c_str()));
+    i++;
+  }
+  Log(Fmt(L"· 人格目录已刷新（%d 项）：%s", i, dir.c_str()));
+}
+
+static void OnDirItemActivate() {
+  int sel = ListView_GetNextItem(g_list_dir, -1, LVNI_SELECTED);
+  if (sel < 0) return;
+  wchar_t name[MAX_PATH] = {};
+  LVITEMW item = {};
+  item.mask = LVIF_TEXT;
+  item.iItem = sel;
+  item.pszText = name;
+  item.cchTextMax = MAX_PATH;
+  ListView_GetItem(g_list_dir, &item);
+  if (!name[0]) return;
+  std::wstring path = JoinPath(PersonaDir(), name);
+  if (GetFileAttributesW(path.c_str()) & FILE_ATTRIBUTE_DIRECTORY) {
+    Log(L"· 目录项不支持编辑：" + path);
+    return;
+  }
+  LoadPersonaIntoEditor(path.c_str());
+  g_cur_tab = TAB_PERSONA;
+  ShowCurrentPage();
+  InvalidateRect(g_main, nullptr, TRUE);
+}
+
+// ------------------------------------------------------------
+// 自绘主题
+// ------------------------------------------------------------
+
+static void DrawRounded(HDC dc, RECT rc, COLORREF fill, int radius) {
+  HBRUSH br = CreateSolidBrush(fill);
+  HRGN rgn = CreateRoundRectRgn(rc.left, rc.top, rc.right + 1, rc.bottom + 1, radius * 2, radius * 2);
+  HBRUSH old = (HBRUSH)SelectObject(dc, br);
+  FillRgn(dc, rgn, br);
+  SelectObject(dc, old);
+  DeleteObject(rgn);
+  DeleteObject(br);
+}
+
+static void DrawButton(LPDRAWITEMSTRUCT d) {
+  for (auto& b : g_btns) {
+    if (b.h != d->hwndItem) continue;
+    // 缓冲绘制：先铺父背景清残影，再画圆角本体，杜绝描边错位
+    HDC mem = CreateCompatibleDC(d->hDC);
+    HBITMAP bmp = CreateCompatibleBitmap(d->hDC, d->rcItem.right - d->rcItem.left,
+                                         d->rcItem.bottom - d->rcItem.top);
+    HBITMAP old = (HBITMAP)SelectObject(mem, bmp);
+    RECT rc = d->rcItem;
+    OffsetRect(&rc, -rc.left, -rc.top);
+    FillRect(mem, &rc, g_br_bg);
+    COLORREF fill = b.hover ? C_CTRL_HV : b.fill;
+    DrawRounded(mem, rc, fill, 8);
+    SetBkMode(mem, TRANSPARENT);
+    SetTextColor(mem, b.text);
+    HFONT oldf = (HFONT)SelectObject(mem, g_font);
+    wchar_t text[128] = {};
+    GetWindowTextW(b.h, text, 128);
+    DrawTextW(mem, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    SelectObject(mem, oldf);
+    BitBlt(d->hDC, 0, 0, d->rcItem.right - d->rcItem.left, d->rcItem.bottom - d->rcItem.top, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    return;
+  }
+}
+
+// 页签条自绘
+static void DrawTabStrip(HDC dc, const RECT& strip) {
+  // 底
+  RECT bg = strip;
+  FillRect(dc, &bg, g_br_bg);
+  // 底部细线
+  HPEN line = CreatePen(PS_SOLID, 1, C_LINE);
+  HPEN oldp = (HPEN)SelectObject(dc, line);
+  MoveToEx(dc, strip.left, strip.bottom - 1, nullptr);
+  LineTo(dc, strip.right, strip.bottom - 1);
+  SelectObject(dc, oldp);
+  DeleteObject(line);
+
+  // 状态徽章（右对齐，DT_CALCRECT 量宽防截断）
+  InstallInfo info = DetectInstall();
+  std::wstring build = info.found ? IdentifyBundle(info.cjsPath.c_str()) : L"";
+  COLORREF dot = build == L"TZCode 破甲版（已部署）"  ? C_OK
+                 : build == L"官方原版" ? C_WARN
+                                        : (info.found ? C_ERR : C_TEXT2);
+  std::wstring short_ = build == L"TZCode 破甲版（已部署）" ? L"● 已部署破甲"
+                        : build == L"官方原版" ? L"● 官方原版"
+                                               : (info.found ? L"● 未知构建" : L"● 未检测到安装");
+  HFONT oldt = (HFONT)SelectObject(dc, g_font_tab);
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, dot);
+  RECT meas = {0, 0, 0, 0};
+  DrawTextW(dc, short_.c_str(), -1, &meas, DT_CALCRECT | DT_SINGLELINE);
+  RECT dotRc = {strip.right - 8 - (meas.right - meas.left), strip.top + 4, strip.right - 8,
+                strip.top + 34};
+  DrawTextW(dc, short_.c_str(), -1, &dotRc, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+  SelectObject(dc, oldt);
+
+  // 主标题（徽章之后绘制，互不侵占）
+  oldt = (HFONT)SelectObject(dc, g_font_title);
+  SetTextColor(dc, C_TEXT);
+  RECT titleRc = {strip.left + 6, strip.top + 4, strip.right - 8 - (meas.right - meas.left) - 24,
+                  strip.top + 34};
+  DrawTextW(dc, L"ZCode 破甲弹", -1, &titleRc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  SelectObject(dc, oldt);
+
+  // 页签
+  HFONT oldf = (HFONT)SelectObject(dc, g_font_tab);
+  int x = strip.left + 6;
+  int wTab = 118;
+  for (int t = 0; t < TAB_COUNT; t++) {
+    RECT tr = {x, strip.top + 42, x + wTab, strip.bottom - 1};
+    bool sel = (t == g_cur_tab);
+    if (sel) {
+      RECT fillRc = tr;
+      FillRect(dc, &fillRc, g_br_panel);
+      HPEN acc = CreatePen(PS_SOLID, 3, C_ACCENT);
+      HPEN op = (HPEN)SelectObject(dc, acc);
+      MoveToEx(dc, tr.left, tr.bottom - 1, nullptr);
+      LineTo(dc, tr.right, tr.bottom - 1);
+      SelectObject(dc, op);
+      DeleteObject(acc);
+      SetTextColor(dc, C_TEXT);
+    } else {
+      SetTextColor(dc, C_TEXT2);
+    }
+    DrawTextW(dc, TAB_NAMES[t], -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    x += wTab;
+  }
+  SelectObject(dc, oldf);
+}
+
+static void PaintMain(HWND hwnd) {
+  PAINTSTRUCT ps;
+  HDC dc = BeginPaint(hwnd, &ps);
+  RECT rc;
+  GetClientRect(hwnd, &rc);
+
+  FillRect(dc, &rc, g_br_bg);
+  DrawTabStrip(dc, g_tab_strip);
+
+  // 部署页状态卡片底板
+  if (g_cur_tab == TAB_DEPLOY) {
+    DrawRounded(dc, g_card_deploy, C_PANEL, 10);
+    // 卡片标题
+    SetBkMode(dc, TRANSPARENT);
+    HFONT old = (HFONT)SelectObject(dc, g_font_title);
+    SetTextColor(dc, C_TEXT2);
+    RECT tr = g_card_deploy;
+    tr.left += 18; tr.top += 12; tr.bottom = tr.top + 24;
+    DrawTextW(dc, L"部署状态", -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+  }
+
+  // 目录页自绘表头带（替代系统亮白表头）
+  if (g_cur_tab == TAB_DIR) {
+    int px = 24, pw = rc.right - px * 2;
+    int py = g_tab_strip.bottom + 8;
+    RECT head = {px, py, px + pw, py + 40};
+    DrawRounded(dc, head, C_PANEL, 8);
+    SetBkMode(dc, TRANSPARENT);
+    HFONT old = (HFONT)SelectObject(dc, g_font);
+    SetTextColor(dc, C_TEXT2);
+    RECT c0 = {head.left + 20, head.top, head.left + 420, head.bottom};
+    DrawTextW(dc, L"名称", -1, &c0, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT c1 = {head.left + 450, head.top, head.left + 600, head.bottom};
+    DrawTextW(dc, L"大小", -1, &c1, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    RECT c2 = {head.left + 630, head.top, head.right - 20, head.bottom};
+    DrawTextW(dc, L"修改时间", -1, &c2, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+  }
+  EndPaint(hwnd, &ps);
+}
+
+// ------------------------------------------------------------
+// 布局与页签
+// ------------------------------------------------------------
+
+static void ShowCurrentPage() {
+  for (int t = 0; t < TAB_COUNT; t++)
+    for (HWND c : g_pages[t]) ShowWindow(c, t == g_cur_tab ? SW_SHOW : SW_HIDE);
+}
+
+static void Layout() {
+  RECT rc;
+  GetClientRect(g_main, &rc);
+  int W = rc.right, H = rc.bottom;
+
+  g_tab_strip = {12, 10, W - 12, 10 + 84};
+  int px = 24, py = g_tab_strip.bottom + 8;
+  int pw = W - px * 2, ph = H - py - 12;
+
+  // 部署页
+  g_card_deploy = {px, py, px + pw, py + 218};
+  int y = py + 44;
+  for (HWND s : {g_s_install, g_s_build, g_s_file, g_s_check, g_s_persona}) {
+    MoveWindow(s, px + 18, y, pw - 36, 22, TRUE);
+    y += 30;
+  }
+  y = g_card_deploy.bottom + 16;
+    MoveWindow(g_btn_deploy, px, y, 170, 44, TRUE);
+    MoveWindow(g_btn_restore, px + 182, y, 170, 44, TRUE);
+    MoveWindow(g_btn_refresh, px + 364, y, 170, 44, TRUE);
+    MoveWindow(g_btn_restart, px + 546, y, 170, 44, TRUE);
+
+  // 人格页
+  MoveWindow(g_s_personainfo, px + 4, py + 2, pw - 8, 22, TRUE);
+  MoveWindow(g_edit_persona, px, py + 30, pw, ph - 84, TRUE);
+  MoveWindow(g_btn_save, px, py + ph - 46, 230, 40, TRUE);
+  MoveWindow(g_btn_reload, px + 242, py + ph - 46, 170, 40, TRUE);
+  MoveWindow(g_btn_notepad, px + 424, py + ph - 46, 190, 40, TRUE);
+
+  // 目录页（列表下移 48px 给自绘表头带让位）
+  MoveWindow(g_list_dir, px, py + 48, pw, ph - 104, TRUE);
+  MoveWindow(g_btn_dir_refresh, px, py + ph - 46, 170, 40, TRUE);
+  MoveWindow(g_btn_dir_explorer, px + 182, py + ph - 46, 250, 40, TRUE);
+
+  // 日志页
+  MoveWindow(g_edit_log, px, py, pw, ph, TRUE);
+
+  InvalidateRect(g_main, nullptr, TRUE);
+}
+
+static HWND MakeStatic(int tab, HWND parent, const wchar_t* text, bool on_panel) {
+  HWND h = CreateWindowW(L"STATIC", text, WS_CHILD | SS_LEFT, 0, 0, 0, 0, parent, nullptr, nullptr, nullptr);
+  RegPage(tab, h);
+  g_label_colors[h] = C_TEXT;
+  if (on_panel) g_panel_labels.insert(h);
+  return h;
+}
+
+static HWND MakeButton(int tab, HWND parent, const wchar_t* text, int id, COLORREF fill, COLORREF txt) {
+  HWND h = CreateWindowW(L"BUTTON", text, WS_CHILD | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, parent,
+                         (HMENU)(INT_PTR)id, nullptr, nullptr);
+  RegPage(tab, h);
+  g_btns.push_back({h, fill, txt, false});
+  return h;
+}
+
+// ------------------------------------------------------------
+// 窗口过程
+// ------------------------------------------------------------
+
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+  switch (msg) {
+    case WM_CREATE: {
+      g_br_bg = CreateSolidBrush(C_BG);
+      g_br_panel = CreateSolidBrush(C_PANEL);
+      g_br_ctrl = CreateSolidBrush(C_CTRL);
+      g_br_ctrl_hv = CreateSolidBrush(C_CTRL_HV);
+      g_br_edit = CreateSolidBrush(RGB(28, 29, 34));
+
+      g_font = CreateFontW(18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                           CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+      g_font_title = CreateFontW(24, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                 CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+      g_font_tab = CreateFontW(19, 0, 0, 0, FW_MEDIUM, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                               CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+      g_font_mono = CreateFontW(17, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0,
+                                CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascadia Mono");
+
+      // 部署页
+      g_s_install = MakeStatic(TAB_DEPLOY, hwnd, L"安装目录：检测中…", true);
+      g_s_build = MakeStatic(TAB_DEPLOY, hwnd, L"当前构建：检测中…", true);
+      g_s_file = MakeStatic(TAB_DEPLOY, hwnd, L"文件信息：—", true);
+      g_s_check = MakeStatic(TAB_DEPLOY, hwnd, L"标记验证：—", true);
+      g_s_persona = MakeStatic(TAB_DEPLOY, hwnd, L"人格文件：检测中…", true);
+      g_btn_deploy = MakeButton(TAB_DEPLOY, hwnd, L"🚀 部署破甲", IDC_DEPLOY, C_ACCENT, RGB(255, 255, 255));
+      g_btn_restore = MakeButton(TAB_DEPLOY, hwnd, L"♻ 恢复官方", IDC_RESTORE, C_CTRL, C_TEXT);
+      g_btn_refresh = MakeButton(TAB_DEPLOY, hwnd, L"🔄 刷新状态", IDC_REFRESH, C_CTRL, C_TEXT);
+      g_btn_restart = MakeButton(TAB_DEPLOY, hwnd, L"⚡ 重启 ZCode", IDC_RESTART_ZCODE, C_CTRL, C_TEXT);
+
+      // 人格页
+      g_s_personainfo = MakeStatic(TAB_PERSONA, hwnd, L"编辑文件：—", false);
+      g_edit_persona = CreateWindowW(
+          L"EDIT", L"",
+          WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN,
+          0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
+      RegPage(TAB_PERSONA, g_edit_persona);
+      g_btn_save = MakeButton(TAB_PERSONA, hwnd, L"💾 保存（生效于新对话）", IDC_PERSONA_SAVE, C_ACCENT, RGB(255, 255, 255));
+      g_btn_reload = MakeButton(TAB_PERSONA, hwnd, L"↺ 重新加载", IDC_PERSONA_RELOAD, C_CTRL, C_TEXT);
+      g_btn_notepad = MakeButton(TAB_PERSONA, hwnd, L"📝 用记事本打开", IDC_PERSONA_NOTEPAD, C_CTRL, C_TEXT);
+
+      // 目录页
+      g_list_dir = CreateWindowW(WC_LISTVIEWW, L"",
+                                 WS_CHILD | WS_VSCROLL | LVS_REPORT | LVS_SHOWSELALWAYS |
+                                     LVS_NOCOLUMNHEADER,
+                                 0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
+      RegPage(TAB_DIR, g_list_dir);
+      ListView_SetExtendedListViewStyle(g_list_dir,
+                                        LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+      ListView_SetBkColor(g_list_dir, C_PANEL);
+      ListView_SetTextBkColor(g_list_dir, C_PANEL);
+      ListView_SetTextColor(g_list_dir, C_TEXT);
+      {
+        // 首列自带表头视觉（自绘替代系统亮白表头）
+        LVCOLUMNW col = {};
+        col.mask = LVCF_TEXT | LVCF_WIDTH;
+        col.pszText = const_cast<LPWSTR>(L"  📄 文件名");
+        col.cx = 420;
+        ListView_InsertColumn(g_list_dir, 0, &col);
+        col.pszText = const_cast<LPWSTR>(L"大小");
+        col.cx = 160;
+        ListView_InsertColumn(g_list_dir, 1, &col);
+        col.pszText = const_cast<LPWSTR>(L"修改时间");
+        col.cx = 220;
+        ListView_InsertColumn(g_list_dir, 2, &col);
+      }
+      // 行高：用绝对字号撑高行（近似 2 倍行距的呼吸感）
+      {
+        HIMAGELIST img = ImageList_Create(1, 34, ILC_COLOR, 1, 1);
+        ListView_SetImageList(g_list_dir, img, LVSIL_SMALL);
+      }
+      g_btn_dir_refresh = MakeButton(TAB_DIR, hwnd, L"🔄 刷新", IDC_DIR_REFRESH, C_CTRL, C_TEXT);
+      g_btn_dir_explorer = MakeButton(TAB_DIR, hwnd, L"📂 在资源管理器中打开", IDC_DIR_EXPLORER, C_CTRL, C_TEXT);
+
+      // 日志页
+      g_edit_log = CreateWindowW(L"EDIT", L"",
+                                 WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL,
+                                 0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
+      RegPage(TAB_LOG, g_edit_log);
+
+      for (int t = 0; t < TAB_COUNT; t++)
+        for (HWND c : g_pages[t]) SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE);
+      SendMessageW(g_edit_persona, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+      SendMessageW(g_edit_log, WM_SETFONT, (WPARAM)g_font_mono, TRUE);
+
+      Log(L"ZCode 破甲弹 v2.1 就绪。弹药：TZCode 破甲构建（3.14.3 同源 · 人格热装载 · 已授权话术）。");
+      SetTimer(hwnd, 1, 400, nullptr);
+      RefreshStatus();
+      LoadPersonaIntoEditor(PersonaPath().c_str());
+      RefreshDirList();
+      g_cur_tab = g_start_tab;
+      ShowCurrentPage();
+      return 0;
+    }
+    case WM_PAINT:
+      PaintMain(hwnd);
+      return 0;
+    case WM_ERASEBKGND:
+      return 1;  // 自绘 WM_PAINT 全覆盖
+    case WM_SIZE:
+      Layout();
+      return 0;
+    case WM_TIMER: {
+      return 0;  // 预留：后续可用于状态自动刷新
+    }
+    case WM_LBUTTONDOWN: {
+      // 页签点击命中（客户区物理像素，DPI aware 已声明）
+      POINT pt = {LOWORD(lParam), HIWORD(lParam)};
+      int stripBottom = g_tab_strip.bottom;
+      int stripTop = g_tab_strip.top + 42;
+      if (pt.y >= stripTop && pt.y <= stripBottom && pt.x >= g_tab_strip.left &&
+          pt.x <= g_tab_strip.right) {
+        int idx = (pt.x - (g_tab_strip.left + 6)) / 118;
+        if (idx >= 0 && idx < TAB_COUNT && g_cur_tab != idx) {
+          g_cur_tab = idx;
+          ShowCurrentPage();
+          InvalidateRect(hwnd, nullptr, TRUE);
+        }
+      }
+      return 0;
+    }
+    case WM_MOUSEMOVE: {
+      // 按钮悬停
+      POINT pt = {LOWORD(lParam), HIWORD(lParam)};
+      bool changed = false;
+      for (auto& b : g_btns) {
+        RECT rc;
+        GetWindowRect(b.h, &rc);
+        MapWindowPoints(HWND_DESKTOP, hwnd, (LPPOINT)&rc, 2);
+        bool now = !!PtInRect(&rc, pt);
+        if (IsWindowVisible(b.h) && now != b.hover) {
+          b.hover = now;
+          InvalidateRect(b.h, nullptr, TRUE);
+          changed = true;
+        }
+      }
+      (void)changed;
+      return 0;
+    }
+    case WM_DRAWITEM: {
+      DrawButton((LPDRAWITEMSTRUCT)lParam);
+      return TRUE;
+    }
+    case WM_CTLCOLORSTATIC: {
+      HDC dc = (HDC)wParam;
+      HWND ctrl = (HWND)lParam;
+      SetBkMode(dc, TRANSPARENT);
+      auto it = g_label_colors.find(ctrl);
+      SetTextColor(dc, it != g_label_colors.end() ? it->second : C_TEXT);
+      return (LRESULT)(g_panel_labels.count(ctrl) ? g_br_panel : g_br_bg);
+    }
+    case WM_CTLCOLOREDIT: {
+      HDC dc = (HDC)wParam;
+      SetBkColor(dc, RGB(28, 29, 34));
+      SetTextColor(dc, C_TEXT);
+      return (LRESULT)g_br_edit;
+    }
+    case WM_NOTIFY: {
+      NMHDR* nm = (NMHDR*)lParam;
+      if (nm->hwndFrom == g_list_dir) {
+        if (nm->code == NM_DBLCLK) {
+          OnDirItemActivate();
+          return 0;
+        }
+        if (nm->code == NM_CUSTOMDRAW) {
+          LPNMLVCUSTOMDRAW cd = (LPNMLVCUSTOMDRAW)lParam;
+          if (cd->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+            cd->clrText = C_TEXT;
+            // 斑马行 + 选中行高亮（无网格线的现代列表观感）
+            bool selected = ListView_GetItemState(g_list_dir, (int)cd->nmcd.dwItemSpec,
+                                                  LVIS_SELECTED) & LVIS_SELECTED;
+            cd->clrTextBk = selected ? RGB(52, 66, 96)
+                            : (cd->nmcd.dwItemSpec % 2 == 0) ? C_PANEL : RGB(38, 40, 47);
+            return CDRF_NOTIFYSUBITEMDRAW;
+          }
+          return CDRF_DODEFAULT;
+        }
+      }
+      break;
+    }
+    case WM_COMMAND: {
+      switch (LOWORD(wParam)) {
+        case IDC_DEPLOY: DoDeploy(); break;
+        case IDC_RESTORE: DoRestore(); break;
+        case IDC_RESTART_ZCODE: DoRestartZCode(); break;
+        case IDC_REFRESH: RefreshStatus(); Log(L"· 状态已刷新"); InvalidateRect(hwnd, nullptr, TRUE); break;
+        case IDC_PERSONA_SAVE: SavePersonaFromEditor(); break;
+        case IDC_PERSONA_RELOAD: LoadPersonaIntoEditor(g_editing_path.c_str()); break;
+        case IDC_PERSONA_NOTEPAD:
+          ShellExecuteW(hwnd, L"open", L"notepad.exe",
+                        (g_editing_path.empty() ? PersonaPath() : g_editing_path).c_str(), nullptr,
+                        SW_SHOWNORMAL);
+          break;
+        case IDC_DIR_REFRESH: RefreshDirList(); break;
+        case IDC_DIR_EXPLORER: {
+          CreateDirectoryW(PersonaDir().c_str(), nullptr);
+          ShellExecuteW(hwnd, L"open", PersonaDir().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+          break;
+        }
+      }
+      return 0;
+    }
+    case WM_SETCURSOR: {
+      // 页签区手型
+      if (LOWORD(lParam) == HTCLIENT) {
+        POINT pt;
+        GetCursorPos(&pt);
+        ScreenToClient(hwnd, &pt);
+        if (PtInRect(&g_tab_strip, pt) && pt.y > g_tab_strip.top + 42) {
+          SetCursor(LoadCursorW(nullptr, IDC_HAND));
+          return TRUE;
+        }
+      }
+      break;
+    }
+    case WM_DESTROY:
+      PostQuitMessage(0);
+      return 0;
+  }
+  return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+  // 命令行：--tab=deploy|persona|dir|log 启动直落页签（供自动化/快速定位）
+  {
+    wchar_t* cmd = GetCommandLineW();
+    if (cmd && wcsstr(cmd, L"--tab=persona")) g_start_tab = TAB_PERSONA;
+    else if (cmd && wcsstr(cmd, L"--tab=dir")) g_start_tab = TAB_DIR;
+    else if (cmd && wcsstr(cmd, L"--tab=log")) g_start_tab = TAB_LOG;
+  }
+  // DPI aware：声明真 DPI 感知，客户区坐标 == 物理像素，命中测试不再漂移
+  {
+    HMODULE user = GetModuleHandleW(L"user32.dll");
+    if (user) {
+      typedef BOOL(WINAPI * SetProcDpiAwareFn)(int);
+      SetProcDpiAwareFn fn = (SetProcDpiAwareFn)GetProcAddress(user, "SetProcessDPIAware");
+      if (fn) fn(2);  // PROCESS_PER_MONITOR_DPI_AWARE
+    }
+  }
+
+  INITCOMMONCONTROLSEX icc = {sizeof(icc),
+                              ICC_STANDARD_CLASSES | ICC_WIN95_CLASSES | ICC_LISTVIEW_CLASSES};
+  InitCommonControlsEx(&icc);
+
+  WNDCLASSW wc = {};
+  wc.lpfnWndProc = WndProc;
+  wc.hInstance = inst;
+  wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  wc.hbrBackground = nullptr;
+  wc.lpszClassName = L"ZCodeArmorPiercer";
+  RegisterClassW(&wc);
+
+  g_main = CreateWindowW(L"ZCodeArmorPiercer", APP_TITLE, WS_OVERLAPPEDWINDOW,
+                         CW_USEDEFAULT, CW_USEDEFAULT, 1000, 700, nullptr, nullptr, inst, nullptr);
+  ShowWindow(g_main, show);
+  UpdateWindow(g_main);
+
+  MSG msg;
+  while (GetMessageW(&msg, nullptr, 0, 0)) {
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+  }
+  return (int)msg.wParam;
+}
