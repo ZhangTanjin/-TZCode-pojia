@@ -289,6 +289,7 @@ static std::wstring QoderWorkerPath();
 static std::wstring QoderPersonaDir();
 static std::wstring QoderPersonaPath();
 static bool QoderArmored(const std::wstring& worker);
+static void ReportResult(const std::wstring& summary, bool ok);
 static HWND g_btn_deploy, g_btn_restore, g_btn_refresh, g_btn_restart;
 static RECT g_card_deploy = {};
 static RECT g_card_qoder = {};
@@ -486,10 +487,13 @@ static void DoDeploy() {
   if (build == L"TZCode 破甲版（已部署）") {
     Log(L"✅ 部署成功——完全退出并重启 ZCode 后生效。");
     EnsureDefaultPersona();
+    RefreshStatus();
+    ReportResult(L"ZCode 破甲部署成功。\n\n完全退出并重启 ZCode 后，开新对话生效。", true);
   } else {
     Log(L"✗ 部署后验证未通过。");
+    RefreshStatus();
+    ReportResult(L"ZCode 部署后验证未通过。\n\n详情见日志页。", false);
   }
-  RefreshStatus();
 }
 
 static void DoRestartZCode() {
@@ -554,6 +558,7 @@ static void DoRestore() {
   }
   Log(L"✓ 已恢复官方原版。重启 ZCode 后生效。");
   RefreshStatus();
+  ReportResult(L"ZCode 已恢复官方原版。\n\n重启 ZCode 后生效。", true);
 }
 
 // ---------- 人格编辑 ----------
@@ -671,10 +676,22 @@ static bool QoderArmored(const std::wstring& worker) {
   return BytesContain(bytes, "qoder-cn/persona.txt");
 }
 
+// 操作反馈：日志落账 + 自动跳日志页 + 弹窗摘要（部署页上必须看得见结果）
+static void ReportResult(const std::wstring& summary, bool ok) {
+  Log(L"---- 操作完成 ----");
+  RefreshStatus();
+  g_cur_tab = TAB_LOG;
+  ShowCurrentPage();
+  InvalidateRect(g_main, nullptr, TRUE);
+  MessageBoxW(g_main, summary.c_str(), ok ? L"TY 破甲弹 · 成功" : L"TY 破甲弹 · 失败",
+              MB_OK | (ok ? MB_ICONINFORMATION : MB_ICONWARNING));
+}
+
 static void DoQoderDeploy() {
   std::wstring worker = QoderWorkerPath();
   if (worker.empty() || GetFileAttributesW(worker.c_str()) == INVALID_FILE_ATTRIBUTES) {
     Log(L"✗ 未找到 Qoder worker 运行时（需已安装 Qoder CN）。");
+    ReportResult(L"未找到 Qoder worker 运行时。\n\n请确认已安装 Qoder CN。", false);
     return;
   }
   HRSRC res = FindResourceW(nullptr, L"QARMOR", RT_RCDATA);
@@ -689,10 +706,13 @@ static void DoQoderDeploy() {
   std::wstring err;
   if (!WriteFileAtomic(worker.c_str(), data, size, &err)) {
     Log(L"✗ Qoder 装甲写入失败：" + err + L"（完全退出 Qoder 后重试）");
+    ReportResult(L"Qoder 装甲写入失败：\n" + err + L"\n\n请完全退出 Qoder（托盘右键退出）后重试。", false);
     return;
   }
   Log(Fmt(L"✓ Qoder worker 已装甲（%s 字节，官方原件备份 .official.bak）。",
           FormatNumber(size).c_str()));
+  std::wstring summary =
+      L"Qoder worker 已装甲（" + FormatNumber(size) + L" 字节）。\n官方原件已备份 .official.bak。\n";
   HRSRC rp = FindResourceW(nullptr, L"QPERSONA", RT_RCDATA);
   if (rp) {
     HGLOBAL hp = LoadResource(nullptr, rp);
@@ -702,16 +722,22 @@ static void DoQoderDeploy() {
       std::wstring ppath = QoderPersonaPath();
       if (GetFileAttributesW(ppath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         CreateDirectoryW(QoderPersonaDir().c_str(), nullptr);
-        if (WriteFileAtomic(ppath.c_str(), pd, ps, &err))
+        if (WriteFileAtomic(ppath.c_str(), pd, ps, &err)) {
           Log(Fmt(L"✓ Qoder 人格已播种（%s 字节）——完全退出 Qoder 后开新对话生效。",
                   FormatNumber(ps).c_str()));
+          summary += L"Qoder 人格已播种（" + FormatNumber(ps) + L" 字节）。\n";
+        }
       } else {
         Log(L"· Qoder 人格已存在，保留现有版本。");
+        summary += L"Qoder 人格已存在，保留现有版本。\n";
       }
     }
   }
-  Log(std::wstring(L"· 验证：") +
-      (QoderArmored(worker) ? L"✅ Qoder 装甲标记在位。" : L"✗ 未检出装甲标记。"));
+  bool ok = QoderArmored(worker);
+  summary += ok ? L"\n验证通过：装甲标记在位。\n\n完全退出 Qoder 后开新对话生效。"
+                : L"\n验证未通过：未检出装甲标记。";
+  Log(std::wstring(L"· 验证：") + (ok ? L"✅ Qoder 装甲标记在位。" : L"✗ 未检出装甲标记。"));
+  ReportResult(summary, ok);
 }
 
 static void DoQoderRestore() {
@@ -719,13 +745,16 @@ static void DoQoderRestore() {
   std::wstring bak = worker + L".official.bak";
   if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES) {
     Log(L"✗ 未找到 Qoder 官方备份。");
+    ReportResult(L"未找到 Qoder 官方备份（.official.bak）。\n\n没有可恢复的官方原件。", false);
     return;
   }
   if (!CopyFileW(bak.c_str(), worker.c_str(), FALSE)) {
     Log(L"✗ Qoder 恢复失败（完全退出 Qoder 后重试）。");
+    ReportResult(L"Qoder 恢复失败：worker 文件被占用。\n\n请完全退出 Qoder（托盘右键退出）后重试。", false);
     return;
   }
   Log(L"✓ Qoder worker 已恢复官方原件。");
+  ReportResult(L"Qoder worker 已恢复官方原件。\n\n完全退出 Qoder 后开新对话生效。", true);
 }
 
 // ---------- 人格目录 ----------

@@ -63,3 +63,8 @@ WEAPON UPDATE v5.1 - TY UI dual-zone (2026-10-20)
   per-zone status lines + action buttons inside card bounds (overlap fixed)
   page title TY; worker path shortened to avoid wrap; Qoder live status (worker/armor/persona)
   screenshot: shot-ty-deploy.png
+
+WEAPON UPDATE v5.2 - visible action feedback (2026-10-21)
+  deploy/restore actions (both zones) now: auto-switch to log tab, refresh status,
+  and pop a result MessageBox - no more silent success/failure.
+  root cause of no-reaction: output went to the log page only; worker file never locked.
