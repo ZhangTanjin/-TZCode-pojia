@@ -1,0 +1,10 @@
+﻿VERIFIED TRANSACTION P2 - Qoder persona loader (identity layer)
+TARGET   : C:\Users\ASUS\AppData\Local\Programs\Qoder CN\resources\app.asar.unpacked\node_modules\@qoder-ai\qoder-cn-agent-sdk\dist\_worker\qoder-worker-runtime.obf.mjs  (armored v1, AE19A3C2...)
+needle 1 : Opl="You are a Qoder agent."
+needle 2 : Hpl=`You are ${rr}.`
+live  sha256 : AE19A3C2260C3A8E0539F729D2E8D457A68FA0B2F4C612D80445C9D05BE6E1CD
+mod   sha256 : F65300B602E85A5E2A5BC897717A465CE67CA05258F3C77F0644BFE8AB3A9B49
+checks: hook1=True fb1=True fb2=True path=True old-gone=True fallback-intact=True
+
+ROLLBACK: re-run apply_qoder_armor.ps1 -Original <.mjs.official.bak> to restore armored v1,
+          or copy .mjs.official.bak for full factory reset.

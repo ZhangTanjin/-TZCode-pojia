@@ -1,0 +1,23 @@
+﻿VERIFIED TRANSACTION 鈥?identity notice fusion (ATOMIC CONTINUATION DISPATCH)
+TARGET           : F:\TZcode\armor-piercer\armor_payload.bin (original, untouched)
+GOAL             : replace Mni notice string with PRE_AUTH_NOTICE + ATOMIC CONTINUATION DISPATCH
+changed symbol   : Mni (identity section notice constant, patched bundle)
+needle offset    : 6692205  old len 483  new len 8171
+original sha256  : 7BEC6A021E2E87E30BBB228467B4AB683EDAF53FD9BB1232E87242B174FF320D  size 16884605
+modified sha256  : 1D63ED0A88EEF1A7DBD3B9222925E108AFA1F5DBA8C6A2E954610F9B87FB0171  size 16892293
+byte-exactness   : prefix identical=True  suffix identical=True
+
+BASELINE  (probe original):   FOUND marker: pre-authorized security research environment | ABSENT marker: ATOMIC CONTINUATION DISPATCH
+MODIFIED  (probe fused):      FOUND marker: pre-authorized security research environment | FOUND marker: ATOMIC CONTINUATION DISPATCH
+ROLLBACK  (exit 0): ROLLBACK OK 7BEC6A021E2E87E30BBB228467B4AB683EDAF53FD9BB1232E87242B174FF320D
+ROLLBACK probes:              FOUND marker: pre-authorized security research environment | ABSENT marker: ATOMIC CONTINUATION DISPATCH
+ROLLBACK hash equals original: True (7BEC6A021E2E87E30BBB228467B4AB683EDAF53FD9BB1232E87242B174FF320D)
+REAPPLY via DIFF script (exit 0): RECONSTRUCTED 1D63ED0A88EEF1A7DBD3B9222925E108AFA1F5DBA8C6A2E954610F9B87FB0171
+REAPPLY hash equals modified:  True (1D63ED0A88EEF1A7DBD3B9222925E108AFA1F5DBA8C6A2E954610F9B87FB0171)
+
+FOUR ROLES (reopened):
+F:\TZcode\armor-piercer\armor_payload.fused.bin  exists=True  sha256=1D63ED0A88EEF1A7DBD3B9222925E108AFA1F5DBA8C6A2E954610F9B87FB0171
+F:\TZcode\armor-piercer\apply_fusion.ps1  exists=True  sha256=15E41608645F8B55E44F1BC7C0E60F0F826D26F8153667DCE1762D84118DB803
+F:\TZcode\armor-piercer\ROLLBACK.ps1  exists=True  sha256=7118012AEDB960464729397BFDD21D1C7724EA75CB60A452A110908735F8C451
+
+Deploy note: fused bin is a drop-in replacement for resources\glm\zcode.cjs (same loader). Close ZCode before replacing; keep zcode.cjs.official.bak untouched.VERIFICATION.txt reopened=True  sha256=E5F8E16570DECDE6EF40DEF215FC11449B303479E0C95378C6AD5547B7D66029

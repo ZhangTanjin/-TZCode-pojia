@@ -1,0 +1,18 @@
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.14.41
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+[1] vcvars ok rc=0
+C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64\cl.exe
+Microsoft (R) Windows (R) Resource Compiler Version 10.0.10011.16384
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+[2] rc step rc=0
+zcode_armor_piercer.cpp
+zcode_armor_piercer.cpp(11): warning C4005: “UNICODE”: 宏重定义
+zcode_armor_piercer.cpp(11): note: 之前在命令行上声明的“UNICODE”
+zcode_armor_piercer.cpp(12): warning C4005: “_UNICODE”: 宏重定义
+zcode_armor_piercer.cpp(12): note: 之前在命令行上声明的“_UNICODE”
+[3] cl step rc=0
+[OK] build success

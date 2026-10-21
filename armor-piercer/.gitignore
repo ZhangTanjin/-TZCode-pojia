@@ -1,0 +1,13 @@
+# build intermediates
+.tmp_*
+*.obj
+app.res
+piercer.exe
+
+# local-only rollback insurance (large binaries, kept on disk, not in git)
+*.bak.exe
+armor_payload.pre-fusion.bin
+
+# runtime noise
+Thumbs.db
+desktop.ini

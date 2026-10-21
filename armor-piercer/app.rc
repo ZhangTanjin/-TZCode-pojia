@@ -3,5 +3,12 @@
 // 破甲弹药：TZCode 破甲构建（3.14.3 同源 · 人格热装载 · 已授权话术）
 ARMOR RCDATA "armor_payload.bin"
 
+// TY 双弹 — Qoder 装甲 worker 运行时（预授权声明 + persona 装载钩）与 Qoder 人格
+QARMOR RCDATA "qoder_armor_payload.mjs"
+QPERSONA RCDATA "qoder_persona.txt"
+
+// 人格母本：标准人格 v2（scope 全密度 · 抗压缩 · 执行摘要），一键装填恢复
+PERSONA RCDATA "persona.txt"
+
 // 管理员权限清单（Program Files 写入需要）
 1 24 "app.manifest"
