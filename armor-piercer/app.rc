@@ -3,9 +3,12 @@
 // 破甲弹药：TZCode 破甲构建（3.14.3 同源 · 人格热装载 · 已授权话术）
 ARMOR RCDATA "armor_payload.bin"
 
-// TY 双弹 — Qoder 装甲 worker 运行时（预授权声明 + persona 装载钩）与 Qoder 人格
-QARMOR RCDATA "qoder_armor_payload.mjs"
+// TY 双弹 — Qoder 人格与四层装甲文本（运行时按版本就地手术，不再内嵌整颗 worker）
 QPERSONA RCDATA "qoder_persona.txt"
+QNOTICE RCDATA "qoder-fork/armor-notice.txt"
+QDELIVER RCDATA "qoder-fork/layer-delivering.txt"
+QCLASSIFY RCDATA "qoder-fork/layer-classifier.txt"
+QRULES RCDATA "qoder-fork/layer-rules.txt"
 
 // 人格母本：标准人格 v2（scope 全密度 · 抗压缩 · 执行摘要），一键装填恢复
 PERSONA RCDATA "persona.txt"

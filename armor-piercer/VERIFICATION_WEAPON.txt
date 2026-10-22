@@ -131,3 +131,16 @@ QODER ARMOR v5 - survives the 0.4.9 versioned-install migration (2026-10-22)
   GUI FIX   : QoderWorkerPath() now enumerates .qoder-versions descending, falls back to legacy.
   VERIFIED  : live worker 05238F9A; daemon respawns from the .qoder-versions worker path;
               weapon 3F1A7CC8 embeds the 0.4.9 payload (new key present, old key absent).
+
+WEAPON v6 - Qoder armor engine compiled in (2026-10-22)
+  change : removed the 33MB static QARMOR payload; the exe now carries a native,
+           version-agnostic armor engine (C++) plus the four layer texts.
+  engine : base64+XOR decode with key sniffed from the worker header; targets matched
+           by decoded content (notice / # Delivering work / classifier / CHECK rules);
+           identity hook injected into both identity constants (names auto-detected);
+           verify = new cipher present + old cipher gone (idempotent when identical).
+  parity : engine output on the official 0.4.9 worker == PS build byte-for-byte (05238F9A)
+  idem   : re-running on an armored worker keeps the same hash
+  gui    : worker path follows .qoder-versions (newest first); restore finds newest .official.bak-*
+  size   : weapon 50.4MB -> 17.2MB
+  live   : CA4F8319 (17,213,440 bytes); no worker payload baked in

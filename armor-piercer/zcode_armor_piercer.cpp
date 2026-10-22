@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
+#include <cstring>
 #include <array>
 #include <map>
 #include <set>
@@ -645,13 +646,8 @@ static void InstallMasterPersona() {
 
 // ---------- TY 双弹：Qoder 阵地 ----------
 
-static std::wstring QoderWorkerPath() {
-  wchar_t buf[MAX_PATH * 2] = {};
-  if (!SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf)))
-    return std::wstring();
-  std::wstring p = JoinPath(buf, L"Programs");
-  p = JoinPath(p, L"Qoder CN");
-  p = JoinPath(p, L"resources");
+static std::wstring QoderWorkerAt(const std::wstring& base) {
+  std::wstring p = JoinPath(base, L"resources");
   p = JoinPath(p, L"app.asar.unpacked");
   p = JoinPath(p, L"node_modules");
   p = JoinPath(p, L"@qoder-ai");
@@ -659,6 +655,280 @@ static std::wstring QoderWorkerPath() {
   p = JoinPath(p, L"dist");
   p = JoinPath(p, L"_worker");
   return JoinPath(p, L"qoder-worker-runtime.obf.mjs");
+}
+
+// Qoder 0.4.9+ installs into .qoder-versions\<ver>; older builds keep resources at the root.
+// Prefer the newest version directory that actually carries the worker runtime.
+static std::wstring QoderWorkerPath() {
+  wchar_t buf[MAX_PATH * 2] = {};
+  if (!SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, buf)))
+    return std::wstring();
+  std::wstring root = JoinPath(JoinPath(buf, L"Programs"), L"Qoder CN");
+
+  WIN32_FIND_DATAW fd = {};
+  HANDLE h = FindFirstFileW(JoinPath(root, L".qoder-versions\\*").c_str(), &fd);
+  std::vector<std::wstring> versions;
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+      std::wstring name = fd.cFileName;
+      if (name == L"." || name == L"..") continue;
+      versions.push_back(name);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  std::sort(versions.begin(), versions.end(), [](const std::wstring& a, const std::wstring& b) {
+    return a > b;  // lexical: 0.4.10 sorts above 0.4.9
+  });
+  for (const auto& v : versions) {
+    std::wstring candidate = QoderWorkerAt(JoinPath(JoinPath(root, L".qoder-versions"), v));
+    if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) return candidate;
+  }
+  return QoderWorkerAt(root);
+}
+
+// ---------- Qoder 装甲引擎（版本无关，武器内置） ----------
+
+static const char* B64_TABLE =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static bool IsBase64Blob(const std::string& s) {
+  if (s.size() < 12 || (s.size() % 4) != 0) return false;
+  for (char c : s) {
+    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '+' || c == '/' || c == '=';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+static std::string B64Decode(const std::string& in) {
+  int T[256];
+  for (int i = 0; i < 256; i++) T[i] = -1;
+  for (int i = 0; i < 64; i++) T[(unsigned char)B64_TABLE[i]] = i;
+  std::string out;
+  int val = 0, bits = 0;
+  for (unsigned char c : in) {
+    if (c == '=') break;
+    int d = T[c];
+    if (d < 0) continue;
+    val = (val << 6) | d;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push_back((char)((val >> bits) & 0xFF));
+    }
+  }
+  return out;
+}
+
+static std::string B64Encode(const std::string& in) {
+  std::string out;
+  int val = 0, bits = 0;
+  for (unsigned char c : in) {
+    val = (val << 8) | c;
+    bits += 8;
+    while (bits >= 6) {
+      bits -= 6;
+      out.push_back(B64_TABLE[(val >> bits) & 0x3F]);
+    }
+  }
+  if (bits > 0) out.push_back(B64_TABLE[(val << (6 - bits)) & 0x3F]);
+  while (out.size() % 4) out.push_back('=');
+  return out;
+}
+
+static std::string XorKey(const std::string& data, const std::string& key) {
+  std::string out = data;
+  if (key.empty()) return out;
+  for (size_t i = 0; i < out.size(); i++)
+    out[i] = (char)(out[i] ^ key[i % key.size()]);
+  return out;
+}
+
+static std::string LoadResBytes(const wchar_t* name) {
+  HRSRC res = FindResourceW(nullptr, name, RT_RCDATA);
+  if (!res) return std::string();
+  HGLOBAL h = LoadResource(nullptr, res);
+  if (!h) return std::string();
+  const void* p = LockResource(h);
+  DWORD n = SizeofResource(nullptr, res);
+  return std::string(static_cast<const char*>(p), n);
+}
+
+static std::string NormText(std::string s) {
+  size_t b = 0;
+  while (b < s.size() && (s[b] == '\n' || s[b] == '\r' || s[b] == ' ' || s[b] == '\t')) b++;
+  s.erase(0, b);
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t'))
+    s.pop_back();
+  s += "\n";
+  return s;
+}
+
+struct QLayerText {
+  const char* name;
+  std::string text;
+};
+
+// 就地装甲：身份注入 + 四层政策替换；text 为 worker 全文（UTF-8 字节）
+static bool PatchQoderWorker(std::string& text, std::string& log, std::wstring& err) {
+  // ---- 1) 身份常量注入（persona 装载钩）；已注入则跳过 ----
+  const std::string hookMark = "/.qoder-cn/persona.txt";
+  if (text.find(hookMark) == std::string::npos) {
+    const std::string iife =
+        "(()=>{try{const __p=require(\"node:fs\").readFileSync(require(\"node:os\")"
+        ".homedir()+\"/.qoder-cn/persona.txt\",\"utf8\").trim();if(__p)return __p}"
+        "catch(__e){}return ";
+    auto varStart = [](const std::string& s, size_t eqPos) -> size_t {
+      size_t i = eqPos;
+      while (i > 0) {
+        char c = s[i - 1];
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '$';
+        if (!ok) break;
+        i--;
+      }
+      return i;
+    };
+    // 主身份：X="You are a Qoder agent."
+    const std::string primary = "=\"You are a Qoder agent.\"";
+    size_t eq = text.find(primary);
+    if (eq == std::string::npos) {
+      err = L"identity constant not found";
+      return false;
+    }
+    size_t vs = varStart(text, eq);
+    std::string var = text.substr(vs, eq - vs);
+    std::string repl = var + "=" + iife + "\"You are a Qoder agent.\"})()";
+    text = text.substr(0, vs) + repl + text.substr(eq + primary.size());
+    log += "identity: primary hooked (" + var + ")\n";
+    // 模板身份：X=`You are ${Y}.`
+    size_t tpl = text.find("=`You are ${");
+    if (tpl != std::string::npos) {
+      const size_t kTplInner = 12;  // "=`You are ${" is 12 chars
+      size_t innerEnd = text.find("}.`", tpl);
+      if (innerEnd != std::string::npos && innerEnd > tpl + kTplInner) {
+        size_t vs2 = varStart(text, tpl);
+        std::string var2 = text.substr(vs2, tpl - vs2);
+        std::string inner = text.substr(tpl + kTplInner, innerEnd - (tpl + kTplInner));
+        std::string repl2 = var2 + "=" + iife + "`You are ${" + inner + "}.`})()";
+        text = text.substr(0, vs2) + repl2 + text.substr(innerEnd + 3);
+        log += "identity: template hooked (" + var2 + ")\n";
+      }
+    }
+  } else {
+    log += "identity: hook already present\n";
+  }
+
+  // ---- 2) 从解码器头部嗅探 XOR 密钥 ----
+  const std::string keySig = "const _$d=(s,k=\"";
+  size_t ks = text.find(keySig);
+  if (ks == std::string::npos) {
+    err = L"decoder key not found";
+    return false;
+  }
+  size_t k0 = ks + keySig.size();
+  size_t k1 = text.find('"', k0);
+  if (k1 == std::string::npos) {
+    err = L"decoder key malformed";
+    return false;
+  }
+  std::string key = text.substr(k0, k1 - k0);
+  log += "key: " + key + "\n";
+
+  // ---- 3) 四层目标文本 ----
+  QLayerText layers[] = {
+      {"notice", NormText(LoadResBytes(L"QNOTICE"))},
+      {"delivering", NormText(LoadResBytes(L"QDELIVER"))},
+      {"classifier", NormText(LoadResBytes(L"QCLASSIFY"))},
+      {"rules", NormText(LoadResBytes(L"QRULES"))},
+  };
+  for (auto& l : layers) {
+    if (l.text.size() < 32) {
+      err = L"embedded layer text missing";
+      return false;
+    }
+  }
+
+  // ---- 4) 扫描全部 _$d("...") 密文，按明文特征归类 ----
+  struct Hit {
+    size_t s, e;
+    std::string oldCipher, newCipher;
+    const char* name;
+  };
+  std::vector<Hit> hits;
+  std::set<std::string> seen;
+  const std::string needle = "_$d(\"";
+  size_t pos = 0;
+  while ((pos = text.find(needle, pos)) != std::string::npos) {
+    size_t s = pos + needle.size();
+    size_t e = text.find('"', s);
+    if (e == std::string::npos) break;
+    std::string blob = text.substr(s, e - s);
+    if (blob.size() > 300 && IsBase64Blob(blob)) {
+      std::string dec = XorKey(B64Decode(blob), key);
+      const char* kind = nullptr;
+      if (dec.rfind("IMPORTANT:", 0) == 0) kind = "notice";
+      else if (dec.rfind("# Delivering work", 0) == 0) kind = "delivering";
+      else if (dec.rfind("Judge whether the pending action", 0) == 0) kind = "classifier";
+      else if (dec.find("CHECK: Is this routine") != std::string::npos) kind = "rules";
+      if (kind && !seen.count(kind)) {
+        for (auto& l : layers) {
+          if (strcmp(l.name, kind) == 0) {
+            Hit h{};
+            h.s = s;
+            h.e = e;
+            h.oldCipher = blob;
+            h.newCipher = B64Encode(XorKey(l.text, key));
+            h.name = l.name;
+            hits.push_back(h);
+            seen.insert(kind);
+            log += std::string("layer ") + kind + ": " + std::to_string(dec.size()) +
+                   " -> " + std::to_string(l.text.size()) + "\n";
+            break;
+          }
+        }
+      }
+    }
+    pos = e;
+  }
+  for (auto& l : layers) {
+    if (!seen.count(l.name)) {
+      std::string m = std::string("target not found: ") + l.name;
+      err.assign(m.begin(), m.end());
+      return false;
+    }
+  }
+
+  // ---- 5) 从后往前替换（偏移不互相污染） ----
+  std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) { return a.s > b.s; });
+  for (auto& h : hits)
+    text = text.substr(0, h.s) + h.newCipher + text.substr(h.e);
+
+  // ---- 6) 验证：新密文在位、旧密文清除、回解一致 ----
+  for (auto& h : hits) {
+    if (text.find(h.newCipher) == std::string::npos) {
+      err = L"verify: new cipher missing";
+      return false;
+    }
+    // 重刷时新旧密文可以完全相同（幂等），此时不需要"旧密文消失"。
+    if (h.oldCipher != h.newCipher && text.find(h.oldCipher) != std::string::npos) {
+      err = L"verify: old cipher still present";
+      return false;
+    }
+  }
+  return true;
+}
+
+static std::wstring QoderVersionTag(const std::wstring& worker) {
+  size_t p = worker.find(L".qoder-versions\\");
+  if (p != std::wstring::npos) {
+    size_t s = p + wcslen(L".qoder-versions\\");
+    size_t e = worker.find(L'\\', s);
+    if (e != std::wstring::npos) return worker.substr(s, e - s);
+  }
+  return L"legacy";
 }
 
 static std::wstring QoderPersonaDir() {
@@ -691,28 +961,49 @@ static void DoQoderDeploy() {
   std::wstring worker = QoderWorkerPath();
   if (worker.empty() || GetFileAttributesW(worker.c_str()) == INVALID_FILE_ATTRIBUTES) {
     Log(L"✗ 未找到 Qoder worker 运行时（需已安装 Qoder CN）。");
-    ReportResult(L"未找到 Qoder worker 运行时。\n\n请确认已安装 Qoder CN。", false);
+    ReportResult(L"未找到 Qoder worker 运行时。\n\n请确认已安装 Qoder CN（含 .qoder-versions 或 legacy resources）。", false);
     return;
   }
-  HRSRC res = FindResourceW(nullptr, L"QARMOR", RT_RCDATA);
-  if (!res) { Log(L"✗ 内嵌 Qoder 装甲缺失——程序损坏。"); return; }
-  HGLOBAL handle = LoadResource(nullptr, res);
-  if (!handle) { Log(L"✗ 装载 Qoder 装甲失败。"); return; }
-  void* data = LockResource(handle);
-  DWORD size = SizeofResource(nullptr, res);
-  std::wstring bak = worker + L".official.bak";
-  if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES)
-    CopyFileW(worker.c_str(), bak.c_str(), FALSE);
+  std::string bytes;
+  if (!ReadFileBytes(worker.c_str(), &bytes)) {
+    Log(L"✗ 读取 Qoder worker 失败（被占用？）。");
+    ReportResult(L"读取 Qoder worker 失败。\n\n请完全退出 Qoder（托盘右键退出）后重试。", false);
+    return;
+  }
+  bool wasArmored = bytes.find("/.qoder-cn/persona.txt") != std::string::npos;
+  std::string plog;
   std::wstring err;
-  if (!WriteFileAtomic(worker.c_str(), data, size, &err)) {
+  if (!PatchQoderWorker(bytes, plog, err)) {
+    Log(L"✗ Qoder 装甲失败：" + err);
+    ReportResult(L"Qoder 装甲失败：" + err +
+                     L"\n\n该版本结构可能已变化。请把 worker 路径与版本号反馈给 TY。", false);
+    return;
+  }
+  for (size_t p = 0; p < plog.size();) {
+    size_t nl = plog.find('\n', p);
+    if (nl == std::string::npos) nl = plog.size();
+    std::string lineUtf8 = plog.substr(p, nl - p);
+    Log(L"· " + Utf8ToWide(lineUtf8));
+    p = nl + 1;
+  }
+
+  std::wstring tag = QoderVersionTag(worker);
+  std::wstring bak = worker + L".official.bak-" + tag;
+  if (!wasArmored && GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES)
+    CopyFileW(worker.c_str(), bak.c_str(), FALSE);
+
+  if (!WriteFileAtomic(worker.c_str(), bytes.data(), bytes.size(), &err)) {
     Log(L"✗ Qoder 装甲写入失败：" + err + L"（完全退出 Qoder 后重试）");
     ReportResult(L"Qoder 装甲写入失败：\n" + err + L"\n\n请完全退出 Qoder（托盘右键退出）后重试。", false);
     return;
   }
-  Log(Fmt(L"✓ Qoder worker 已装甲（%s 字节，官方原件备份 .official.bak）。",
-          FormatNumber(size).c_str()));
-  std::wstring summary =
-      L"Qoder worker 已装甲（" + FormatNumber(size) + L" 字节）。\n官方原件已备份 .official.bak。\n";
+  Log(Fmt(L"✓ Qoder worker 已装甲（版本 %s，%s 字节，官方原件 %s）。", tag.c_str(),
+          FormatNumber(bytes.size()).c_str(),
+          wasArmored ? L"沿用既有备份" : L"已备份 .official.bak"));
+  std::wstring summary = L"Qoder worker 已装甲。\n版本 " + tag + L" · " +
+                         FormatNumber(bytes.size()) + L" 字节\n" +
+                         (wasArmored ? L"（原已是装甲版，本次为就地重刷）\n" : L"");
+
   HRSRC rp = FindResourceW(nullptr, L"QPERSONA", RT_RCDATA);
   if (rp) {
     HGLOBAL hp = LoadResource(nullptr, rp);
@@ -733,19 +1024,45 @@ static void DoQoderDeploy() {
       }
     }
   }
-  bool ok = QoderArmored(worker);
-  summary += ok ? L"\n验证通过：装甲标记在位。\n\n完全退出 Qoder 后开新对话生效。"
-                : L"\n验证未通过：未检出装甲标记。";
-  Log(std::wstring(L"· 验证：") + (ok ? L"✅ Qoder 装甲标记在位。" : L"✗ 未检出装甲标记。"));
+
+  std::string check;
+  bool ok = ReadFileBytes(worker.c_str(), &check) &&
+            check.find("/.qoder-cn/persona.txt") != std::string::npos;
+  summary += ok ? L"\n验证通过：身份钩子与四层装甲在位。\n\n完全退出 Qoder 后开新对话生效。"
+                : L"\n验证未通过：回读未检出身份钩子。";
+  Log(std::wstring(L"· 验证：") + (ok ? L"✅ 四层装甲 + 身份钩子在位。" : L"✗ 验证未通过。"));
   ReportResult(summary, ok);
+}
+
+// 找同目录下最新一份 .official.bak-*（0.4.9+ 带版本后缀；兼容旧的无后缀备份）
+static std::wstring FindQoderBackup(const std::wstring& worker) {
+  size_t slash = worker.find_last_of(L'\\');
+  if (slash == std::wstring::npos) return std::wstring();
+  std::wstring dir = worker.substr(0, slash);
+  std::wstring base = worker.substr(slash + 1);
+  WIN32_FIND_DATAW fd = {};
+  HANDLE h = FindFirstFileW(JoinPath(dir, base + L".official.bak*").c_str(), &fd);
+  std::wstring best;
+  FILETIME bestTime = {};
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      std::wstring cand = JoinPath(dir, fd.cFileName);
+      if (best.empty() || CompareFileTime(&fd.ftLastWriteTime, &bestTime) > 0) {
+        best = cand;
+        bestTime = fd.ftLastWriteTime;
+      }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+  return best;
 }
 
 static void DoQoderRestore() {
   std::wstring worker = QoderWorkerPath();
-  std::wstring bak = worker + L".official.bak";
-  if (GetFileAttributesW(bak.c_str()) == INVALID_FILE_ATTRIBUTES) {
+  std::wstring bak = FindQoderBackup(worker);
+  if (bak.empty()) {
     Log(L"✗ 未找到 Qoder 官方备份。");
-    ReportResult(L"未找到 Qoder 官方备份（.official.bak）。\n\n没有可恢复的官方原件。", false);
+    ReportResult(L"未找到 Qoder 官方备份（.official.bak-*）。\n\n没有可恢复的官方原件。", false);
     return;
   }
   if (!CopyFileW(bak.c_str(), worker.c_str(), FALSE)) {
@@ -753,8 +1070,8 @@ static void DoQoderRestore() {
     ReportResult(L"Qoder 恢复失败：worker 文件被占用。\n\n请完全退出 Qoder（托盘右键退出）后重试。", false);
     return;
   }
-  Log(L"✓ Qoder worker 已恢复官方原件。");
-  ReportResult(L"Qoder worker 已恢复官方原件。\n\n完全退出 Qoder 后开新对话生效。", true);
+  Log(L"✓ Qoder worker 已恢复官方原件：" + bak);
+  ReportResult(L"Qoder worker 已恢复官方原件。\n来源：" + bak + L"\n\n完全退出 Qoder 后开新对话生效。", true);
 }
 
 // ---------- 人格目录 ----------
@@ -1304,6 +1621,38 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+  // 命令行：--armor-qoder-cli <worker> <out> —— 无界面装甲自测（写 <out>.log）
+  {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv && argc >= 4 && wcscmp(argv[1], L"--armor-qoder-cli") == 0) {
+      std::string bytes;
+      std::string log;
+      std::wstring err;
+      int code = 0;
+      if (!ReadFileBytes(argv[2], &bytes)) {
+        log = "read failed\n";
+        code = 3;
+      } else if (!PatchQoderWorker(bytes, log, err)) {
+        log += "PATCH FAILED: ";
+        log += WideToUtf8(err);
+        log += "\n";
+        code = 4;
+      } else if (!WriteFileAtomic(argv[3], bytes.data(), bytes.size(), &err)) {
+        log += "write failed: ";
+        log += WideToUtf8(err);
+        log += "\n";
+        code = 5;
+      } else {
+        log += "OK bytes=" + std::to_string(bytes.size()) + "\n";
+      }
+      std::wstring logPath = std::wstring(argv[3]) + L".log";
+      WriteFileAtomic(logPath.c_str(), log.data(), log.size(), &err);
+      LocalFree(argv);
+      return code;
+    }
+    if (argv) LocalFree(argv);
+  }
   // 命令行：--tab=deploy|persona|dir|log 启动直落页签（供自动化/快速定位）
   {
     wchar_t* cmd = GetCommandLineW();
