@@ -104,3 +104,13 @@ FIX NOTE - Qoder agent lost its own capability awareness (2026-10-22)
             tool vocabulary intact: Read 5276 / Write 1941 / Edit 1571 / Bash 390 / WebFetch 52
   SCOPE   : only 4 layers replaced (notice, Delivering work, classifier, persona intro).
             Tool defs, task loop, context mgmt, skills, plugin system untouched.
+
+DSH ARMOR (deepseek-harness) - 2026-10-22
+  mechanism: official patch layer only. No binary, no asar, no source edits.
+  target row: system-prompt -> personaPrefix (order 0) / personaSuffix (order 10200)
+  finding: dsh ships NO content-refusal prompt section (SAFETY.md is docs only);
+           approval + sandbox are execution services, not prompt text.
+  installed: C:\Users\ASUS\.dsh\cordis.patch.yml (home layer, all profiles)
+  verified : --dump-config with --patch and from home layer; provenance line and
+             doctrine text both present in both dumps.
+  tooling  : dsh-armor.patch.yml / install_dsh_armor.ps1 / dump-config*.txt
