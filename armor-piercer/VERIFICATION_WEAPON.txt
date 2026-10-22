@@ -114,3 +114,20 @@ DSH ARMOR (deepseek-harness) - 2026-10-22
   verified : --dump-config with --patch and from home layer; provenance line and
              doctrine text both present in both dumps.
   tooling  : dsh-armor.patch.yml / install_dsh_armor.ps1 / dump-config*.txt
+
+QODER ARMOR v5 - survives the 0.4.9 versioned-install migration (2026-10-22)
+  FAILURE   : Qoder updated to 0.4.9, which installs into .qoder-versions\<ver>\. The old
+              armor stayed in the legacy resources\ path and was never executed. Additionally
+              the worker obfuscation key rotated (qInfTBqB6D3R -> xTYcnsXvGjPv), so the old
+              patcher could not have matched the new build.
+  NEW ROUND : AC9D686D (official 0.4.9) -> 05238F9A (armored)
+              layers patched: notice 675 -> 1020, delivering 2017 -> 2094,
+              classifier 3869 -> 2122, rules 1995 -> 1408 (new blob introduced in 0.4.9),
+              identity hook installed on Geu/Jeu (renamed from Opl/Hpl)
+  TOOLING   : patch_qoder_all.ps1 - version-agnostic: auto-detects newest .qoder-versions
+              worker, auto-detects the XOR key from the decoder header, matches blobs by
+              decoded content (not offsets), patches every target, verifies roundtrip +
+              old-blob removal. -Deploy backs up to .official.bak-<ver>.
+  GUI FIX   : QoderWorkerPath() now enumerates .qoder-versions descending, falls back to legacy.
+  VERIFIED  : live worker 05238F9A; daemon respawns from the .qoder-versions worker path;
+              weapon 3F1A7CC8 embeds the 0.4.9 payload (new key present, old key absent).
