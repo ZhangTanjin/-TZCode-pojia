@@ -153,3 +153,13 @@ ZCODE 3.16.3 RE-ARMOR (2026-10-23)
   fused   : 97490D0F -> 588CA541 (six-point verify all True)
   backup  : zcode.cjs.official.bak-3.16.3 (97490D0F); 3.15 bak retained
   tooling : patch_zcode_3163.ps1 (content-matched anchors, not offsets)
+
+ZCODE 3.16.3 RE-ARMOR FIX (2026-10-23)
+  incident : first 3.16.3 round broke ZCode startup (sql_failed surfaced a syntax-broken bundle).
+  root cause: patch_zcode_3163.ps1 inserted the armor notice RAW into the JS string literal -
+             embedded double quotes and literal newlines terminated the string early; non-ASCII
+             would also be mangled by the Latin-1 byte-preserving write.
+  fix      : Escape-Js routine (backslash/quote/newline/tab -> escapes, non-ASCII -> \uXXXX).
+  evidence : node --check on the fused bundle = SYNTAX OK; loader unit test reads persona (4168 B).
+  round    : 97490D0F (official) -> A66393BC (fused, six-point verify + ascii purity + node check)
+  lesson   : always node --check the fused bundle BEFORE deploy - added to the workflow.
