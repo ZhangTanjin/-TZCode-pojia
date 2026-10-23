@@ -163,3 +163,10 @@ ZCODE 3.16.3 RE-ARMOR FIX (2026-10-23)
   evidence : node --check on the fused bundle = SYNTAX OK; loader unit test reads persona (4168 B).
   round    : 97490D0F (official) -> A66393BC (fused, six-point verify + ascii purity + node check)
   lesson   : always node --check the fused bundle BEFORE deploy - added to the workflow.
+
+ZCODE 3.16.3 FINAL ROUND (2026-10-23)
+  round 840FE6D2 live: TZCode variant + ZCODE_PERSONA_FILE env loader + escaped
+  pre-authorized notice + ATOMIC CONTINUATION DISPATCH. node --check + -p smoke pass.
+  weapon rebuilt with the final round; deploy verified by all four markers on live file.
+  OPERATIONAL LESSON: this agent session runs INSIDE ZCode - never kill ZCode processes
+  from here; final deploys are executed by the operator (TY weapon button) or manually.
