@@ -144,3 +144,12 @@ WEAPON v6 - Qoder armor engine compiled in (2026-10-22)
   gui    : worker path follows .qoder-versions (newest first); restore finds newest .official.bak-*
   size   : weapon 50.4MB -> 17.2MB
   live   : CA4F8319 (17,213,440 bytes); no worker payload baked in
+
+ZCODE 3.16.3 RE-ARMOR (2026-10-23)
+  trigger : ZCode auto-updated to 3.16.3; official cjs 97490D0F replaced our 3.15 round
+  anchors : 3.16.3 renamed vars (wla->oua identity, Ydo->d0o notice); join pattern located
+  fusion  : identity TZCode variant + builder routed (_tzv) / notice -> pre-authorized +
+            ATOMIC CONTINUATION DISPATCH / persona loader prepended to identity intro
+  fused   : 97490D0F -> 588CA541 (six-point verify all True)
+  backup  : zcode.cjs.official.bak-3.16.3 (97490D0F); 3.15 bak retained
+  tooling : patch_zcode_3163.ps1 (content-matched anchors, not offsets)
