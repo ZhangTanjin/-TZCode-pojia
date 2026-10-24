@@ -170,3 +170,12 @@ ZCODE 3.16.3 FINAL ROUND (2026-10-23)
   weapon rebuilt with the final round; deploy verified by all four markers on live file.
   OPERATIONAL LESSON: this agent session runs INSIDE ZCode - never kill ZCode processes
   from here; final deploys are executed by the operator (TY weapon button) or manually.
+
+QODER 0.4.11 RE-ARMOR + VERSION-SORT FIX (2026-10-24)
+  incident : Qoder updated to 0.4.11; the armored 0.4.9 round was bypassed because both
+             patchers sorted version dirs LEXICALLY (0.4.9 > 0.4.11) and never saw the new dir.
+  fix      : numeric version compare in patch_qoder_all.ps1 ([version] cast) and in the
+             weapon QoderWorkerPath() (part-by-part numeric comparator).
+  round    : 0.4.11 official 8F7869F4 -> armored 611D065B (four layers + identity hook,
+             all verifies True). Daemon restarted, loads the armored 0.4.11 worker.
+  weapon   : 5E1FF520 rebuilt; ledger updated.

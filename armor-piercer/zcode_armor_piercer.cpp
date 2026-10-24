@@ -677,9 +677,19 @@ static std::wstring QoderWorkerPath() {
     } while (FindNextFileW(h, &fd));
     FindClose(h);
   }
-  std::sort(versions.begin(), versions.end(), [](const std::wstring& a, const std::wstring& b) {
-    return a > b;  // lexical: 0.4.10 sorts above 0.4.9
-  });
+  // numeric version compare (0.4.11 > 0.4.9 > 0.4.10 is NOT lexical order)
+  auto versionGreater = [](const std::wstring& a, const std::wstring& b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+      unsigned long va = 0, vb = 0;
+      while (i < a.size() && a[i] != L'.') { va = va * 10 + (a[i] - L'0'); i++; }
+      while (j < b.size() && b[j] != L'.') { vb = vb * 10 + (b[j] - L'0'); j++; }
+      i++; j++;  // skip the dot (or the end)
+      if (va != vb) return va > vb;
+    }
+    return false;
+  };
+  std::sort(versions.begin(), versions.end(), versionGreater);
   for (const auto& v : versions) {
     std::wstring candidate = QoderWorkerAt(JoinPath(JoinPath(root, L".qoder-versions"), v));
     if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) return candidate;

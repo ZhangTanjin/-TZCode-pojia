@@ -14,7 +14,7 @@ if (-not $Worker) {
     $cands = @()
     $verRoot = Join-Path $root '.qoder-versions'
     if (Test-Path $verRoot) {
-        $cands += Get-ChildItem $verRoot -Directory | Sort-Object Name -Descending | ForEach-Object {
+        $cands += Get-ChildItem $verRoot -Directory | Sort-Object { [version]$_.Name } -Descending | ForEach-Object {
             Join-Path $_.FullName 'resources\app.asar.unpacked\node_modules\@qoder-ai\qoder-cn-agent-sdk\dist\_worker\qoder-worker-runtime.obf.mjs'
         }
     }
